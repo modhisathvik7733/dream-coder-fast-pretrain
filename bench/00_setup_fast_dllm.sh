@@ -24,9 +24,17 @@ df -h "$WORKSPACE" 2>/dev/null || df -h /
 echo
 
 # ---- 1. Python deps ----
+# Don't try to upgrade pip — many vast.ai images ship a Debian-managed pip
+# that errors out with "Cannot uninstall pip … RECORD file not found".
+# Pip 24.0 is fine for everything we need.
+# `--break-system-packages` is needed on newer Debian/Ubuntu images that
+# enforce PEP 668; harmless on older ones that ignore the flag.
 echo "=== [1/3] Installing Python packages ==="
-pip install --upgrade pip
-pip install \
+PIP_FLAGS=""
+if pip install --help 2>/dev/null | grep -q "break-system-packages"; then
+    PIP_FLAGS="--break-system-packages"
+fi
+pip install $PIP_FLAGS \
     "transformers==4.48.3" \
     accelerate \
     huggingface_hub \
