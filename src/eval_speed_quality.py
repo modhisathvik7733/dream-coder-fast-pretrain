@@ -1,9 +1,14 @@
 """Evaluate fast Dream-Coder vs vanilla on HumanEval+ across multiple step counts.
 
 Reports:
-  - Pass@1 at each step count (4, 8, 16, 32 steps per block)
-  - Wall time per problem
-  - Comparison vs vanilla baseline at 32 steps
+  - Pass@1 at each step count (4, 8, 16, 32 steps per block) for the trained model
+  - Same step counts on the vanilla baseline (apples-to-apples comparison)
+  - Wall time per problem at each step count for both
+  - Per-step delta: trained - baseline (positive = training helped at that step count)
+
+Headline numbers to look for in the summary:
+  - delta at steps=32: should be near 0 (no regression on the original regime)
+  - delta at steps=4:  should be POSITIVE and large (the whole point of this training)
 """
 from __future__ import annotations
 
@@ -134,7 +139,7 @@ def main():
     del model
     torch.cuda.empty_cache()
 
-    # === Eval vanilla baseline (optional) ===
+    # === Eval vanilla baseline at the SAME step counts (apples-to-apples) ===
     if args.baseline_path:
         print(f"Loading baseline from {args.baseline_path}")
         bmodel = AutoModel.from_pretrained(
@@ -143,25 +148,58 @@ def main():
         btok = AutoTokenizer.from_pretrained(args.baseline_path, trust_remote_code=True)
 
         print()
-        print("=== Vanilla baseline at steps_per_block=32 ===")
-        rate, avg_t = evaluate_at_steps(bmodel, btok, problems, 32, limit=args.limit)
-        results["results"]["baseline_steps_32"] = {
-            "pass_at_1": rate,
-            "avg_time_seconds": avg_t,
-        }
-        print(f"  pass@1: {rate:.4f}  avg_time: {avg_t:.2f}s")
+        for steps in args.steps_per_block:
+            print(f"=== Baseline (vanilla) at steps_per_block={steps} ===")
+            rate, avg_t = evaluate_at_steps(bmodel, btok, problems, steps, limit=args.limit)
+            results["results"][f"baseline_steps_{steps}"] = {
+                "pass_at_1": rate,
+                "avg_time_seconds": avg_t,
+            }
+            print(f"  pass@1: {rate:.4f}  avg_time: {avg_t:.2f}s")
+            print()
+
+        del bmodel
+        torch.cuda.empty_cache()
 
     # === Save ===
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(json.dumps(results, indent=2))
     print(f"\nResults saved to {args.output}")
 
-    # Print summary
+    # === Summary table with deltas (only meaningful when baseline was run) ===
     print("\n=== SUMMARY ===")
-    print(f"{'config':<25} {'pass@1':>10} {'time(s)':>10}")
-    print("-" * 50)
-    for key, val in results["results"].items():
-        print(f"{key:<25} {val['pass_at_1']:>10.4f} {val['avg_time_seconds']:>10.2f}")
+    if args.baseline_path:
+        print(f"{'steps':>5} {'trained pass@1':>16} {'baseline pass@1':>17} "
+              f"{'Δ pass@1':>10} {'trained s':>10} {'baseline s':>11} {'speedup×':>10}")
+        print("-" * 92)
+        for steps in args.steps_per_block:
+            t = results["results"].get(f"trained_steps_{steps}")
+            b = results["results"].get(f"baseline_steps_{steps}")
+            if not t or not b:
+                continue
+            d = t["pass_at_1"] - b["pass_at_1"]
+            speedup = b["avg_time_seconds"] / t["avg_time_seconds"] if t["avg_time_seconds"] > 0 else 0.0
+            print(f"{steps:>5d} {t['pass_at_1']:>16.4f} {b['pass_at_1']:>17.4f} "
+                  f"{d:>+10.4f} {t['avg_time_seconds']:>10.2f} {b['avg_time_seconds']:>11.2f} "
+                  f"{speedup:>9.2f}×")
+
+        # Decision rule prints
+        print()
+        t4 = results["results"].get("trained_steps_4", {}).get("pass_at_1")
+        b32 = results["results"].get("baseline_steps_32", {}).get("pass_at_1")
+        t32 = results["results"].get("trained_steps_32", {}).get("pass_at_1")
+        if t4 is not None and b32 is not None:
+            print(f"trained@4 vs baseline@32:  {t4:.4f} vs {b32:.4f}  (gap = {t4 - b32:+.4f})")
+            print("  Goal: gap > -0.05 (within 5pts of full-step baseline).")
+        if t32 is not None and b32 is not None:
+            print(f"trained@32 vs baseline@32: {t32:.4f} vs {b32:.4f}  (gap = {t32 - b32:+.4f})")
+            print("  Goal: gap > -0.02 (no regression at original step count).")
+    else:
+        print(f"{'config':<25} {'pass@1':>10} {'time(s)':>10}")
+        print("-" * 50)
+        for key, val in results["results"].items():
+            print(f"{key:<25} {val['pass_at_1']:>10.4f} {val['avg_time_seconds']:>10.2f}")
+        print("\n(Pass --baseline_path to get apples-to-apples deltas.)")
 
 
 if __name__ == "__main__":

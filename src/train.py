@@ -212,12 +212,14 @@ def main():
                     help="If >0, override num_epochs and stop after this many steps. Used by smoke test.")
     ap.add_argument("--output_dir_override", type=str, default=None,
                     help="If set, write checkpoints here instead of config.paths.output_dir.")
+    ap.add_argument("--data_dir_override", type=str, default=None,
+                    help="If set, read train.jsonl from here instead of config.paths.data_dir.")
     args = ap.parse_args()
 
     config = OmegaConf.load(args.config)
 
     base_model_path = config.paths.base_model
-    data_dir = Path(config.paths.data_dir)
+    data_dir = Path(args.data_dir_override or config.paths.data_dir)
     output_dir = Path(args.output_dir_override or config.paths.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 

@@ -42,11 +42,12 @@ For 4× A100 40GB instead, change `configs/acc_config` to `num_processes: 4` and
 git clone https://github.com/<your_user>/<this_repo>.git
 cd <this_repo>/fast-pretrain
 
-bash 00_setup.sh          # ~10 min — install deps + download Dream-Coder-Instruct
-bash 01_prepare_data.sh   # ~30 min — pull Ling-Coder-SFT + Stack-Edu-Py
-bash 01b_smoke_train.sh   # ~5-10 min — 5-step pipeline check (RUN THIS BEFORE 02_train.sh)
-bash 02_train.sh          # ~12-20 hours — continued pretraining
-bash 03_validate.sh       # ~30 min — multi-step-count benchmark
+bash 00_setup.sh           # ~10 min  — install deps + download Dream-Coder-Instruct
+bash 01_prepare_data.sh    # ~30 min  — pull Ling-Coder-SFT + Stack-Edu-Py (50k samples)
+bash 01b_smoke_train.sh    # ~10 min  — 5-step pipeline check (always run this)
+bash 02a_scout_train.sh    # ~2-3 hr  — OPTIONAL 5k-sample directional check (~$2-3)
+bash 02_train.sh           # ~12-20h  — full continued pretraining
+bash 03_validate.sh        # ~30 min  — multi-step-count benchmark vs baseline
 ```
 
 Or run training in background via tmux:
@@ -86,6 +87,26 @@ data:
 - **Stage 3 (RL):** `Dream-org/Dream-Coder-RL-17k` with verifiable sandbox rewards
 
 We replay Stage 2 primarily (~90%) plus a small Stage 1 sample for breadth. Using off-distribution data (e.g., KodCode, R1 traces) would shift the model away from its trained behavior. Dream-Coder-RL-17k is **excluded** even though it matches Stage 3 — it's prompts-only (no responses), so it's incompatible with our (prompt, response) masked-diffusion objective.
+
+## Scout run (optional but cheap insurance)
+
+`02a_scout_train.sh` runs the entire pipeline at 1/10 scale: 5k samples, ~80
+optimizer steps, ~2-3h on 1× A100 80GB (~$2-3). It then evaluates against the
+vanilla baseline at step counts 4/8/16/32 and prints a go/no-go decision.
+
+What it catches that the smoke test can't:
+
+- **Bias too aggressive** — if `trained_pass@32` regresses sharply, our 0.3
+  bias is over-shifting and the full run will produce a worse model overall.
+- **Approach not directionally working** — if `trained_pass@4` is no better
+  than `baseline_pass@4`, the bias-mask trick isn't transferring. Debug
+  before scaling.
+
+The full run uses a separate data dir (`/workspace/data/`) so the scout
+artifacts (`/workspace/data_scout/`, `/workspace/scout_output/`) don't
+interfere — you don't have to re-prepare data after a successful scout.
+
+Skip the scout only if you've successfully run this exact recipe before.
 
 ## Smoke test (mandatory before the long run)
 
@@ -181,10 +202,11 @@ gradient_accumulation_steps: 64   # was 32
 fast-pretrain/
 ├── README.md
 ├── 00_setup.sh             Environment + model download
-├── 01_prepare_data.sh      Dataset preparation launcher
-├── 01b_smoke_train.sh      5-step smoke test (run before 02)
-├── 02_train.sh             Training launcher
-├── 03_validate.sh          Multi-step-count benchmark
+├── 01_prepare_data.sh      Dataset preparation launcher (50k samples)
+├── 01b_smoke_train.sh      5-step pipeline smoke test (always run before 02/02a)
+├── 02a_scout_train.sh      5k-sample scout run + validation (optional, ~$2-3)
+├── 02_train.sh             Full training launcher
+├── 03_validate.sh          Multi-step-count benchmark vs baseline
 ├── monitor.sh              tmux session helper
 ├── configs/
 │   ├── training.yaml       All hyperparameters
