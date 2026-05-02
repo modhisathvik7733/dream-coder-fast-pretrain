@@ -10,15 +10,13 @@ Mechanism (masked diffusion training with biased mask ratio):
   hard high-mask-ratio cases, learning to commit many tokens at once confidently.
 
 Loss formulation:
-  L = ce_loss(predict masked tokens) [weighted by 1 / mask_ratio for normalization]
-
-This implementation uses HuggingFace Trainer with custom data collator that applies
-the biased mask ratio at each step.
+  Standard cross-entropy on masked positions only (HF Trainer ignore_index=-100).
+  Logits are shifted by 1 position because Dream-family models predict next-token
+  (position-i logit predicts position-(i+1) token), not same-position (BERT-style).
 """
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import random
 from pathlib import Path
@@ -26,7 +24,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from datasets import load_dataset
 from omegaconf import OmegaConf
 from transformers import (
@@ -41,19 +38,29 @@ torch.manual_seed(42)
 random.seed(42)
 
 
+def shift_logits_right(logits: torch.Tensor) -> torch.Tensor:
+    """Shift logits right by 1 along sequence dimension.
+
+    Required for Dream-family models: position-i logit predicts position-(i+1) token.
+    Same convention as CDLM's `shift_tensors` (gated on `enable_shift=true` for Dream).
+    """
+    # logits: [B, L, V]
+    # After shift: position 0 stays the same; position i (i>0) gets logits from position i-1.
+    return torch.cat([logits[:, :1, :], logits[:, :-1, :]], dim=1)
+
+
 @dataclass
 class MaskedDiffusionCollator:
     """Apply biased mask ratio + padding for masked diffusion training.
 
     For each example, samples mask_ratio = uniform()^bias.
-    bias < 1 biases toward HIGH ratios (hard cases).
+    bias < 1 biases toward HIGH ratios (hard cases, important for low-step decoding).
     """
     tokenizer: Any
     mask_id: int
     pad_id: int
     max_seq_length: int
     mask_ratio_bias: float = 0.3
-    block_size: int = 32
 
     def __call__(self, features):
         batch_size = len(features)
@@ -70,10 +77,10 @@ class MaskedDiffusionCollator:
             attention_mask[i, :n] = 1
 
             # Sample biased mask ratio
-            mask_ratio = (random.random() ** self.mask_ratio_bias)
+            mask_ratio = random.random() ** self.mask_ratio_bias
             mask_ratio = max(0.05, min(0.95, mask_ratio))  # clamp for stability
 
-            # Apply mask to a contiguous response region (last 256 tokens by default)
+            # Apply mask only within the answer/response region (last 256 tokens)
             # Diffusion training masks the answer, not the prompt
             ans_start = max(0, n - 256)
             answer_len = n - ans_start
@@ -95,26 +102,32 @@ class MaskedDiffusionCollator:
         }
 
 
-def compute_loss_for_diffusion(model, inputs, return_outputs=False):
-    """Compute masked diffusion loss: CE on masked positions only."""
-    input_ids = inputs["input_ids"]
-    attention_mask = inputs["attention_mask"]
-    labels = inputs["labels"]
+class DreamDiffusionTrainer(Trainer):
+    """Custom Trainer with Dream-style masked-diffusion loss.
 
-    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-    logits = outputs.logits  # [B, L, V]
-
-    # CE loss only on masked positions (where labels != -100)
-    loss_fct = torch.nn.CrossEntropyLoss(ignore_index=-100)
-    loss = loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
-
-    return (loss, outputs) if return_outputs else loss
-
-
-class DiffusionTrainer(Trainer):
-    """Custom Trainer with masked-diffusion loss."""
+    Key detail: Dream models predict position-(i+1) token from position-i logit,
+    so logits must be shifted right by 1 before computing CE against labels.
+    """
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
-        return compute_loss_for_diffusion(model, inputs, return_outputs)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+        labels = inputs["labels"]
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = outputs.logits  # [B, L, V]
+
+        # Dream convention: shift logits right by 1
+        # so logits[:, i] now represents prediction for position i (was position i+1)
+        shifted_logits = shift_logits_right(logits)
+
+        # CE loss only on masked positions (labels != -100)
+        loss = torch.nn.functional.cross_entropy(
+            shifted_logits.reshape(-1, shifted_logits.size(-1)),
+            labels.reshape(-1),
+            ignore_index=-100,
+        )
+
+        return (loss, outputs) if return_outputs else loss
 
 
 def load_train_data(data_dir: Path):
@@ -140,6 +153,13 @@ def main():
     mask_id = tokenizer.convert_tokens_to_ids("<|mask|>")
     pad_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
+    if mask_id is None or mask_id == tokenizer.unk_token_id:
+        raise ValueError(
+            "Could not resolve <|mask|> token id from tokenizer. "
+            f"Got: {mask_id}. Expected 151666 for Dream-Coder."
+        )
+    print(f"  mask_id = {mask_id}, pad_id = {pad_id}")
+
     # === Load model (full FT, no LoRA) ===
     print(f"Loading model from {base_model_path}")
     model = AutoModel.from_pretrained(
@@ -161,8 +181,15 @@ def main():
         pad_id=pad_id,
         max_seq_length=config.training.max_seq_length,
         mask_ratio_bias=config.distillation.mask_ratio_bias,
-        block_size=config.distillation.block_size,
     )
+
+    # === DeepSpeed config (absolute path) ===
+    # Resolve config relative to THIS script's location for portability
+    script_dir = Path(__file__).resolve().parent.parent  # ../ from src/
+    ds_config_path = script_dir / "configs" / "ds_zero3.yaml"
+    if not ds_config_path.exists():
+        raise FileNotFoundError(f"DeepSpeed config not found: {ds_config_path}")
+    print(f"  DeepSpeed config: {ds_config_path}")
 
     # === Training args ===
     training_args = TrainingArguments(
@@ -181,21 +208,26 @@ def main():
         save_steps=config.training.save_steps,
         save_total_limit=config.training.save_total_limit,
         logging_steps=config.training.logging_steps,
-        report_to=config.logging.report_to if not config.logging.wandb_enabled else "wandb",
-        deepspeed="configs/ds_zero3.yaml",
+        report_to=("wandb" if config.logging.wandb_enabled else config.logging.report_to),
+        deepspeed=str(ds_config_path),
         save_strategy="steps",
         save_safetensors=True,
         remove_unused_columns=False,
-        dataloader_num_workers=4,
+        dataloader_num_workers=2,  # 2 per process × 4 processes = 8 total (CPU-friendly)
     )
 
     # === Train ===
-    trainer = DiffusionTrainer(
+    trainer = DreamDiffusionTrainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
         data_collator=collator,
-        tokenizer=tokenizer,
+        # Use processing_class (new API in transformers >= 4.46), fallback to tokenizer
+        **(
+            {"processing_class": tokenizer}
+            if hasattr(Trainer, "_inner_training_loop")
+            else {"tokenizer": tokenizer}
+        ),
     )
 
     print("Starting training ...")

@@ -17,7 +17,8 @@ fi
 echo "=== Continued pretraining: Dream-Coder for low-step decoding ==="
 echo "  Hardware: 4× A100 PCIe 40GB (DeepSpeed ZeRO Stage 3)"
 echo "  Target: 4 denoising steps per 32-token block (vs 32 baseline)"
-echo "  Loss: CE + KL teacher (full-step) + consistency"
+echo "  Method: standard CE loss with biased mask ratio (bias=0.3, favors high-mask)"
+echo "  Includes: Dream-style logit shift (position-i logit predicts position-(i+1) token)"
 echo "  Effective batch: 128 (4 GPUs × 1 batch × 32 grad_accum)"
 echo "  Expected duration: 50-90 hours"
 echo

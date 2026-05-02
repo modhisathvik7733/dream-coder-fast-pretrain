@@ -26,24 +26,15 @@ training:
   save_steps: 200
   save_total_limit: 3
   logging_steps: 10
-  eval_steps: 200
 
 distillation:
-  # Self-distillation: same model serves as student (low steps) and teacher (full steps)
-  teacher_steps_per_block: 32     # full denoising (vanilla Dream-Coder)
-  student_steps_per_block: 4      # what we want post-training
-  block_size: 32
-
-  # Loss weighting (must sum approximately to 1)
-  loss_weights:
-    ce_ground_truth: 0.5          # standard supervised loss
-    kl_teacher: 0.3               # match full-step teacher distribution
-    consistency: 0.2              # student stable across step counts
-
-  # Mask ratio sampling for masked diffusion training
-  # Vanilla Dream training: uniform [0,1]
-  # For low-step: bias toward HIGH masking (corresponds to early denoising)
-  mask_ratio_bias: 0.3            # ratio = uniform()^bias; lower = more high-mask samples
+  # Standard masked-diffusion CE loss with biased mask ratio.
+  # The trick: bias mask_ratio toward HIGH values so model trains predominantly
+  # on hard high-mask cases (which correspond to early denoising steps).
+  # No teacher model, no consistency loss — just biased data distribution + CE.
+  block_size: 32                  # informational only; not used by current loss
+  mask_ratio_bias: 0.3            # ratio = uniform()^bias; LOWER bias = MORE high-mask samples
+                                  # 0.3 = ~80% of samples have mask_ratio in [0.5, 1.0]
 
 data:
   # Distribution matches Dream-Coder's actual training stages.
