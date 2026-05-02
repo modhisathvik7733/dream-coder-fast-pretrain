@@ -29,6 +29,7 @@ pip install \
     datasets \
     omegaconf \
     wandb \
+    tensorboard \
     hf_transfer \
     evalplus
 
