@@ -1,0 +1,59 @@
+# Continued pretraining config for Dream-Coder low-step decoding.
+# Phase A: train base weights to natively produce good output at 4 steps/block.
+
+paths:
+  base_model: /workspace/models/dream-coder-7b-instruct
+  data_dir: /workspace/data
+  output_dir: /workspace/fast_pretrain_output
+
+training:
+  learning_rate: 1.5e-6           # very low for full FT (prevents catastrophic forgetting)
+  num_epochs: 1                   # ONE epoch (more = higher forgetting risk)
+  per_device_batch_size: 1
+  gradient_accumulation_steps: 32 # effective batch 128 across 4 GPUs
+  max_seq_length: 768             # 512 prompt + 256 generation
+  warmup_ratio: 0.05
+  scheduler: cosine
+  weight_decay: 0.01
+
+  # Memory optimizations (mandatory for 7B FFT on 40GB cards)
+  bf16: true
+  gradient_checkpointing: true
+  optimizer: adamw_bnb_8bit       # 8-bit Adam to fit optimizer states
+  max_grad_norm: 1.0
+
+  # Checkpointing
+  save_steps: 200
+  save_total_limit: 3
+  logging_steps: 10
+  eval_steps: 200
+
+distillation:
+  # Self-distillation: same model serves as student (low steps) and teacher (full steps)
+  teacher_steps_per_block: 32     # full denoising (vanilla Dream-Coder)
+  student_steps_per_block: 4      # what we want post-training
+  block_size: 32
+
+  # Loss weighting (must sum approximately to 1)
+  loss_weights:
+    ce_ground_truth: 0.5          # standard supervised loss
+    kl_teacher: 0.3               # match full-step teacher distribution
+    consistency: 0.2              # student stable across step counts
+
+  # Mask ratio sampling for masked diffusion training
+  # Vanilla Dream training: uniform [0,1]
+  # For low-step: bias toward HIGH masking (corresponds to early denoising)
+  mask_ratio_bias: 0.3            # ratio = uniform()^bias; lower = more high-mask samples
+
+data:
+  python_replay_ratio: 0.4        # 40% original-distribution data (anti-forgetting)
+  reasoning_ratio: 0.3            # 30% reasoning-trace data (preserves R1 distillation)
+  general_code_ratio: 0.3         # 30% general code (KodCode + similar)
+  total_target_samples: 50000     # ~200M tokens at 4096 avg
+  shuffle_seed: 42
+
+logging:
+  wandb_enabled: false            # set true if WANDB_API_KEY is set
+  wandb_project: dream-coder-fast-pretrain
+  report_to: tensorboard
+  output_dir: /workspace/fast_pretrain_output/logs
