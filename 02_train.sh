@@ -1,34 +1,46 @@
 #!/usr/bin/env bash
 # Phase A: Continued pretraining for low-step block decoding.
 # Trains Dream-Coder to produce good output at 4 steps/block instead of 32.
-# ~50-90 hours on 4× A100 PCIe 40GB depending on PCIe version.
+#
+# Hardware target: 1× A100 SXM 80GB (single GPU, no DeepSpeed).
+# Expected duration: ~10-20 hours for 30k samples.
 set -euo pipefail
 
 WORKSPACE="${WORKSPACE:-/workspace}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Sanity check
-if [ ! -d "$WORKSPACE/data" ] || [ -z "$(ls -A "$WORKSPACE/data" 2>/dev/null)" ]; then
-    echo "ERROR: training data not found at $WORKSPACE/data"
+if [ ! -f "$WORKSPACE/data/train.jsonl" ]; then
+    echo "ERROR: training data not found at $WORKSPACE/data/train.jsonl"
     echo "Run bash 01_prepare_data.sh first."
     exit 1
 fi
 
+# Disk space check (training will save ~14GB checkpoints)
+DISK_FREE_GB=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "0")
+echo "Disk free: ${DISK_FREE_GB}GB"
+if [ "${DISK_FREE_GB:-0}" -lt 50 ]; then
+    echo "WARNING: less than 50GB free disk. Training may fail at checkpoint save."
+    echo "  With save_total_limit=2 and 14GB/checkpoint, you need 28GB+ for checkpoints alone."
+    echo "  Recommend: clear /workspace/data/cache or other temp files before continuing."
+fi
+
+echo
 echo "=== Continued pretraining: Dream-Coder for low-step decoding ==="
-echo "  Hardware: 4× A100 PCIe 40GB (DeepSpeed ZeRO Stage 3)"
+echo "  Hardware: 1× A100 SXM 80GB (single GPU, no DeepSpeed)"
 echo "  Target: 4 denoising steps per 32-token block (vs 32 baseline)"
 echo "  Method: standard CE loss with biased mask ratio (bias=0.3, favors high-mask)"
-echo "  Includes: Dream-style logit shift (position-i logit predicts position-(i+1) token)"
-echo "  Effective batch: 128 (4 GPUs × 1 batch × 32 grad_accum)"
-echo "  Expected duration: 50-90 hours"
+echo "  Includes: Dream-style logit shift (verified from generation_utils.py line 413)"
+echo "  Effective batch: 64 (1 GPU × 1 batch × 64 grad_accum)"
+echo "  Samples: 50k × ~600 avg tokens = ~30M tokens"
+echo "  Expected duration: ~12-20 hours"
 echo
 
 START_TIME=$(date +%s)
 
-CUDA_VISIBLE_DEVICES=0,1,2,3 accelerate launch \
+CUDA_VISIBLE_DEVICES=0 accelerate launch \
     --config_file "$SCRIPT_DIR/configs/acc_config" \
-    --num_processes 4 \
-    --main_process_port 29520 \
+    --num_processes 1 \
     "$SCRIPT_DIR/src/train.py" \
     --config "$SCRIPT_DIR/configs/training.yaml"
 

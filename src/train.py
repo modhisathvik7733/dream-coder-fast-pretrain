@@ -17,7 +17,6 @@ Loss formulation:
 from __future__ import annotations
 
 import argparse
-import os
 import random
 from pathlib import Path
 from dataclasses import dataclass
@@ -108,7 +107,8 @@ class DreamDiffusionTrainer(Trainer):
     Key detail: Dream models predict position-(i+1) token from position-i logit,
     so logits must be shifted right by 1 before computing CE against labels.
     """
-    def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        # kwargs absorbs num_items_in_batch (transformers >= 4.46) and other future args
         input_ids = inputs["input_ids"]
         attention_mask = inputs["attention_mask"]
         labels = inputs["labels"]
@@ -183,15 +183,8 @@ def main():
         mask_ratio_bias=config.distillation.mask_ratio_bias,
     )
 
-    # === DeepSpeed config (absolute path) ===
-    # Resolve config relative to THIS script's location for portability
-    script_dir = Path(__file__).resolve().parent.parent  # ../ from src/
-    ds_config_path = script_dir / "configs" / "ds_zero3.yaml"
-    if not ds_config_path.exists():
-        raise FileNotFoundError(f"DeepSpeed config not found: {ds_config_path}")
-    print(f"  DeepSpeed config: {ds_config_path}")
-
     # === Training args ===
+    # Single A100 80GB: no DeepSpeed needed, full FT fits with 8-bit Adam + grad_ckpt
     training_args = TrainingArguments(
         output_dir=str(output_dir),
         num_train_epochs=config.training.num_epochs,
@@ -209,11 +202,10 @@ def main():
         save_total_limit=config.training.save_total_limit,
         logging_steps=config.training.logging_steps,
         report_to=("wandb" if config.logging.wandb_enabled else config.logging.report_to),
-        deepspeed=str(ds_config_path),
         save_strategy="steps",
         save_safetensors=True,
         remove_unused_columns=False,
-        dataloader_num_workers=2,  # 2 per process × 4 processes = 8 total (CPU-friendly)
+        dataloader_num_workers=4,
     )
 
     # === Train ===

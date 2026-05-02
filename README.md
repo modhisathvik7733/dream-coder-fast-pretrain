@@ -18,12 +18,22 @@ Phase C (later):      Train small draft + DFlash speculative decoding
 
 ## Hardware
 
-Designed for: **4× A100 PCIe 40GB** (vast.ai listing types).
-- Memory: DeepSpeed ZeRO Stage 3 + 8-bit AdamW + gradient checkpointing
-- Per-GPU usage: ~30-35 GB during training
-- PCIe 3.0 works (slower); PCIe 4.0 preferred
+Default target: **1× A100 SXM 80GB** (single GPU, no DeepSpeed).
+- Memory: 8-bit AdamW + gradient checkpointing → ~57-62 GB VRAM used (out of 80)
+- Disk: 150 GB recommended (model + datasets + 2 checkpoints + buffer ≈ 73 GB)
+- PCIe 4.0 preferred (faster data transfer)
 
-Single A100 80GB also works (modify configs/acc_config to `num_processes: 1`).
+Memory math:
+| Component | BF16 |
+|---|---|
+| Model weights | 14 GB |
+| Gradients | 14 GB |
+| AdamW 8-bit states | ~14 GB |
+| Activations w/ gradient checkpointing | ~10-15 GB |
+| Workspace | ~5 GB |
+| **Total** | **~57-62 GB** ✅ fits 80GB |
+
+For 4× A100 40GB instead, change `configs/acc_config` to `num_processes: 4` and `distributed_type: DEEPSPEED`.
 
 ## Quick start (after renting on vast.ai)
 
@@ -113,18 +123,18 @@ The "fast" property baked into base weights generally preserves under SFT. Valid
 
 ## Cost estimate
 
-Hardware: 4× A100 PCIe 40GB at vast.ai prices.
+Hardware: 1× A100 SXM 80GB at vast.ai (~$0.89/hr typical).
 
-| Phase | Hours | Cost @ $1.685/hr | Cost @ $3.23/hr |
-|---|---|---|---|
-| Setup | 0.5 | $1 | $2 |
-| Data prep | 0.5 | $1 | $2 |
-| Training | 50-90 | $84-152 | $162-291 |
-| Validation | 1 | $2 | $3 |
-| Buffer | 5 | $9 | $16 |
-| **Total** | ~60-100 | **~$97-165** | **~$185-314** |
+| Phase | Hours | Cost @ $0.89/hr |
+|---|---|---|
+| Setup | 0.3 | $0.30 |
+| Data prep | 0.7 | $0.65 |
+| Training (50k samples, single GPU) | 12-20 | $11-18 |
+| Validation | 0.5 | $0.45 |
+| Buffer | 2 | $1.80 |
+| **Total** | **~15-25** | **~$15-25** |
 
-Recommended: $1.685/hr listing if available (PCIe 3.0, slower training). $3.23/hr for faster.
+Single A100 80GB is dramatically cheaper than 4× A100 40GB and sufficient for this workload.
 
 ## Troubleshooting
 

@@ -1,5 +1,14 @@
 # Continued pretraining config for Dream-Coder low-step decoding.
 # Phase A: train base weights to natively produce good output at 4 steps/block.
+#
+# Hardware target: 1× A100 SXM 80GB (single GPU, no DeepSpeed required).
+# Memory math:
+#   Model BF16:           14 GB
+#   Gradients BF16:       14 GB
+#   AdamW 8-bit states:  ~14 GB
+#   Activations w/ckpt:  ~10-15 GB
+#   Workspace:            ~5 GB
+#   Total:               ~57-62 GB  (fits 80GB comfortably)
 
 paths:
   base_model: /workspace/models/dream-coder-7b-instruct
@@ -10,21 +19,22 @@ training:
   learning_rate: 1.5e-6           # very low for full FT (prevents catastrophic forgetting)
   num_epochs: 1                   # ONE epoch (more = higher forgetting risk)
   per_device_batch_size: 1
-  gradient_accumulation_steps: 32 # effective batch 128 across 4 GPUs
+  gradient_accumulation_steps: 64 # effective batch 64 on single GPU
   max_seq_length: 768             # 512 prompt + 256 generation
   warmup_ratio: 0.05
   scheduler: cosine
   weight_decay: 0.01
 
-  # Memory optimizations (mandatory for 7B FFT on 40GB cards)
+  # Memory optimizations (mandatory for 7B FFT)
   bf16: true
   gradient_checkpointing: true
   optimizer: adamw_bnb_8bit       # 8-bit Adam to fit optimizer states
   max_grad_norm: 1.0
 
-  # Checkpointing
-  save_steps: 200
-  save_total_limit: 3
+  # Checkpointing (target: 150GB disk)
+  # Each checkpoint is ~14GB. save_total_limit=2 = one stable + one being written.
+  save_steps: 250
+  save_total_limit: 2
   logging_steps: 10
 
 distillation:
@@ -42,7 +52,10 @@ data:
   ling_coder_sft_ratio: 0.70      # Stage 2 SFT — what the instruct model was last trained on
   dream_coder_rl_ratio: 0.20      # Stage 3 RL data
   stack_edu_python_ratio: 0.10    # Stage 1 base adaptation coverage
-  total_target_samples: 50000     # ~200M tokens at 4096 avg
+
+  # 50k samples × ~600 avg tokens = ~30M tokens
+  # At ~2-3 forward passes/sec on single A100 80GB: ~12-20 hours of training
+  total_target_samples: 50000
   shuffle_seed: 42
 
 logging:
