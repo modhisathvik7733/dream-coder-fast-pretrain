@@ -1,28 +1,18 @@
 """Dream-Coder diverse best-of-8 — fast_dllm + (optional) torch.compile.
 
-Combines three speedup techniques:
-  1. fast_dllm KV-cache (dual_cache=True)              — ~2× speedup (proven)
-  2. torch.compile(mode="reduce-overhead")             — ~1.5-2× speedup (when it works)
-  3. Diverse best-of-8 with early-stop                 — accuracy via attempt budget
+Adapted from `eval_amplified_diverse_dreamcoder.py` (the Dream-Coder port of
+DiffuCoder's diverse best-of-8 eval). Adds fast_dllm KV-cache on top.
 
-Adapted from:
-  diffucoder_experiments/models/diffucoder-7b-cpgrpo/eval_amplified_diverse_fast.py
-which used DiffuCoder-7B-cpGRPO + torch.compile only. This version targets
-Dream-Coder (or your fine-tuned variant) and adds fast_dllm KV-cache on top.
+Stacks 3 speedup techniques:
+  1. fast_dllm KV-cache (dual_cache=True)              — ~2× per attempt (proven)
+  2. torch.compile(mode="reduce-overhead")             — ~1.5-2× per attempt (when stable)
+  3. Diverse best-of-8 with first-pass early-stop      — accuracy via attempt budget
 
-== Why this works ==
-  Each problem tries up to 8 configurations; the first one that passes wins.
-  Hard problems use more attempts; easy ones short-circuit on attempt 1.
-  fast_dllm's dual_cache shaves ~50% off each forward pass, so the per-attempt
-  cost drops linearly. With early-stop, the total benefit is multiplicative
-  on top of avg_attempts.
+Per-attempt cost is multiplicative on top of avg_attempts (which is typically
+1.3-1.8 with diverse best-of-8). Combined: ~3-5× faster wall-clock vs vanilla
+AutoModel diverse best-of-8 at the same pass@1.
 
-== Expected speedup vs vanilla AutoModel diverse best-of-8 ==
-  Per-attempt:       ~2× from fast_dllm
-  Per-attempt:       ~1.5× from torch.compile (additional, if it survives)
-  Combined:          ~3-4× wall-clock at the same pass@1
-
-Usage (on the vast.ai instance after bench/00_setup_fast_dllm.sh has run):
+Usage (after bench/00_setup_fast_dllm.sh has run on a vast.ai box):
 
     python3 bench/eval_diverse_fastdllm.py \\
         --dream_repo /workspace/Dream-Coder \\
@@ -67,16 +57,16 @@ def run_test(code: str, test_code: str, entry_point: str, timeout: int = 10) -> 
         f.write(full)
         path = f.name
     try:
+        # vast.ai images often have python3 but no `python` symlink.
         p = subprocess.run(["python3", path], capture_output=True, text=True, timeout=timeout)
         return "__OK__" in p.stdout
     except subprocess.TimeoutExpired:
         return False
 
 
-# Diverse sampling configs — same shape as the DiffuCoder version, but step counts
-# tuned for Dream-Coder's 32-token block_length. Each `steps` value MUST be a
-# multiple of (max_new_tokens / block_length) for fast_dllm's block scheduler.
-# Default block_length=32, max_new_tokens=256 → 8 blocks → steps must be multiple of 8.
+# Same 8 diverse configs that worked for DiffuCoder & Dream-Coder.
+# Step counts (256, 128) are multiples of (max_new_tokens / block_length) = 8 — required
+# by fast_dllm's block scheduler.
 DIVERSE_CONFIGS = [
     {"alg": "entropy",      "alg_temp": 0.0, "temperature": 0.2, "top_p": 0.95, "steps": 256},
     {"alg": "entropy",      "alg_temp": 0.0, "temperature": 0.5, "top_p": 0.95, "steps": 256},
@@ -89,12 +79,13 @@ DIVERSE_CONFIGS = [
 ]
 
 
-def setup_fast_dllm_model(
-    dream_repo: Path,
-    model_path: str,
-    use_compile: bool,
-):
-    """Load model via fast_dllm + optional torch.compile + warmup."""
+# Constants for fast_dllm's block scheduler.
+BLOCK_LENGTH = 32
+THRESHOLD = 0.9
+
+
+def setup_fast_dllm_model(dream_repo: Path, model_path: str, use_compile: bool):
+    """Load model via fast_dllm DreamModel + monkey-patch + warmup."""
     sys.path.insert(0, str(dream_repo / "instruct"))
     from src.inference.fast_dllm.modeling_dream import DreamModel  # noqa: E402
     from src.inference.fast_dllm.generation_utils_block import (  # noqa: E402
@@ -108,7 +99,7 @@ def setup_fast_dllm_model(
     ).to("cuda").eval()
     print(f"Loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.1f} GB")
 
-    # Bind block-aware diffusion_generate (the one that supports dual_cache)
+    # Bind block-aware diffusion_generate (the path that supports dual_cache).
     model.diffusion_generate = types.MethodType(
         DreamGenerationMixin.diffusion_generate, model
     )
@@ -122,27 +113,21 @@ def setup_fast_dllm_model(
             print(f"WARNING: torch.compile failed ({type(e).__name__}: {e}).")
             print("Continuing without compile.")
 
-    # Warmup with a representative config so the cache + (maybe) compile graph are hot.
+    # Warmup with a representative config so the cache + (optional) compile graph are hot.
     print("Warming up ...")
-    warmup_text = (
-        "<|im_start|>user\nWrite a function that adds two numbers.<|im_end|>\n"
-        "<|im_start|>assistant\n"
+    warmup_messages = [{"role": "user", "content": "Write add(a,b)."}]
+    warmup_inp = tokenizer.apply_chat_template(
+        warmup_messages, return_tensors="pt", return_dict=True,
+        add_generation_prompt=True,
     )
-    inp = tokenizer(warmup_text, return_tensors="pt").to("cuda")
     t0 = time.time()
     with torch.no_grad():
         _ = model.diffusion_generate(
-            inp.input_ids,
-            attention_mask=inp.attention_mask,
-            max_new_tokens=256,
-            steps=128,
-            temperature=0.2,
-            top_p=0.95,
-            alg="entropy",
-            alg_temp=0.0,
-            dual_cache=True,
-            block_length=32,
-            threshold=0.9,
+            warmup_inp.input_ids.to("cuda"),
+            attention_mask=warmup_inp.attention_mask.to("cuda"),
+            max_new_tokens=256, steps=128,
+            temperature=0.2, top_p=0.95, alg="entropy", alg_temp=0.0,
+            dual_cache=True, block_length=BLOCK_LENGTH, threshold=THRESHOLD,
         )
     print(f"Warmup time: {time.time() - t0:.1f}s")
 
@@ -156,12 +141,21 @@ def evaluate(tokenizer, model, items, max_new_tokens: int):
     t_start = time.time()
 
     for i, (task_id, row) in enumerate(items):
-        prompt = (
-            f"<|im_start|>system\nYou are an expert Python programmer.<|im_end|>\n"
-            f"<|im_start|>user\nComplete the function below. Return only the full function definition in a ```python code block.\n\n"
-            f"```python\n{row['prompt']}\n```<|im_end|>\n<|im_start|>assistant\n"
+        # Use Dream-Coder's chat template (matches the published model card).
+        messages = [{
+            "role": "user",
+            "content": (
+                f"Complete the following Python function. Return only the full function "
+                f"definition in a ```python code block.\n\n"
+                f"```python\n{row['prompt']}\n```"
+            ),
+        }]
+        inputs = tokenizer.apply_chat_template(
+            messages, return_tensors="pt", return_dict=True,
+            add_generation_prompt=True,
         )
-        inp = tokenizer(prompt, return_tensors="pt").to("cuda")
+        input_ids = inputs.input_ids.to("cuda")
+        attention_mask = inputs.attention_mask.to("cuda")
         found = False
         used = 0
 
@@ -169,17 +163,14 @@ def evaluate(tokenizer, model, items, max_new_tokens: int):
             used = j + 1
             with torch.no_grad():
                 out = model.diffusion_generate(
-                    inp.input_ids,
-                    attention_mask=inp.attention_mask,
+                    input_ids, attention_mask=attention_mask,
                     max_new_tokens=max_new_tokens,
-                    dual_cache=True,
-                    block_length=32,
-                    threshold=0.9,
+                    dual_cache=True, block_length=BLOCK_LENGTH, threshold=THRESHOLD,
                     **cfg,
                 )
             seq = out.sequences[0] if hasattr(out, "sequences") else out[0]
             code = extract_code(
-                tokenizer.decode(seq[inp.input_ids.shape[1]:], skip_special_tokens=True)
+                tokenizer.decode(seq[input_ids.shape[1]:], skip_special_tokens=True)
             )
             if run_test(code, row["test"], row["entry_point"]):
                 found = True
@@ -229,7 +220,7 @@ def main():
     print(
         f"\nEvaluating on {len(items)} problems "
         f"(max_new_tokens={args.max_new_tokens}, "
-        f"compile={args.use_compile}, fast_dllm=True dual_cache=True) ...\n"
+        f"compile={args.use_compile}, fast_dllm dual_cache=True) ...\n"
     )
 
     results, n_pass, attempts_used, elapsed = evaluate(
@@ -258,8 +249,8 @@ def main():
                 "max_new_tokens": args.max_new_tokens,
                 "torch_compile": args.use_compile,
                 "fast_dllm_dual_cache": True,
-                "block_length": 32,
-                "threshold": 0.9,
+                "block_length": BLOCK_LENGTH,
+                "threshold": THRESHOLD,
                 "limit": args.limit,
                 "pass_at_1": final,
                 "n_total": len(items),
