@@ -75,7 +75,7 @@ fi
 # ---- Smoke check ----
 echo
 echo "=== Smoke check — load tokenizer + verify mask_id ==="
-python <<EOF
+python3 <<EOF
 from transformers import AutoTokenizer
 tok = AutoTokenizer.from_pretrained("$MODEL_DIR", trust_remote_code=True)
 mask_id = tok.convert_tokens_to_ids("<|mask|>")
@@ -88,7 +88,7 @@ echo "=========================================="
 echo "SETUP COMPLETE"
 echo "=========================================="
 echo "Run the benchmark next:"
-echo "  python bench/fast_dllm_smoke.py \\"
+echo "  python3 bench/fast_dllm_smoke.py \\"
 echo "      --dream_repo $DREAM_REPO \\"
 echo "      --model_path $MODEL_DIR"
 echo
