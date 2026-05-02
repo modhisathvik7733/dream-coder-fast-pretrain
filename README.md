@@ -43,7 +43,7 @@ git clone https://github.com/<your_user>/<this_repo>.git
 cd <this_repo>/fast-pretrain
 
 bash 00_setup.sh           # ~10 min  — install deps + download Dream-Coder-Instruct
-bash 01_prepare_data.sh    # ~30 min  — pull Ling-Coder-SFT + Stack-Edu-Py (50k samples)
+bash 01_prepare_data.sh    # ~6 min   — pull Ling-Coder-SFT (50k samples)
 bash 01b_smoke_train.sh    # ~10 min  — 5-step pipeline check (always run this)
 bash 02a_scout_train.sh    # ~2-3 hr  — OPTIONAL 5k-sample directional check (~$2-3)
 bash 02_train.sh           # ~12-20h  — full continued pretraining
@@ -74,19 +74,23 @@ distillation:
   mask_ratio_bias: 0.3            # biased toward high-mask training
 
 data:
-  # Matches Dream-Coder's ACTUAL training distribution (verified from official repo)
-  ling_coder_sft_ratio: 0.90      # Stage 2 SFT data
-  stack_edu_python_ratio: 0.10    # Stage 1 base coverage
-  total_target_samples: 50000     # ~200M tokens
+  # 100% Ling-Coder-SFT (Stage 2) — matches Dream-Coder-Instruct's training data exactly
+  ling_coder_sft_ratio: 1.00
+  total_target_samples: 50000     # ~30M tokens
 ```
 
-**Why this exact mix?** Verified from `github.com/DreamLM/Dream-Coder`:
+**Why pure Ling-Coder?** Verified from `github.com/DreamLM/Dream-Coder`:
 
-- **Stage 1 (Base):** mix of Stack v2 (40%), Stack-Edu Python (15%), OpenCoder (15%), DCLM (17%), math+general (rest)
+- **Stage 1 (Base):** Stack v2 (40%), Stack-Edu Python (15%), OpenCoder (15%), DCLM (17%), math+general
 - **Stage 2 (Instruct SFT):** ONLY `inclusionAI/Ling-Coder-SFT` (7 epochs)
 - **Stage 3 (RL):** `Dream-org/Dream-Coder-RL-17k` with verifiable sandbox rewards
 
-We replay Stage 2 primarily (~90%) plus a small Stage 1 sample for breadth. Using off-distribution data (e.g., KodCode, R1 traces) would shift the model away from its trained behavior. Dream-Coder-RL-17k is **excluded** even though it matches Stage 3 — it's prompts-only (no responses), so it's incompatible with our (prompt, response) masked-diffusion objective.
+We replay Stage 2 only. Two other sources were tried and rejected:
+
+- **Dream-Coder-RL-17k (Stage 3)** — prompts-only, no responses; incompatible with the (prompt, response) masked-diffusion objective.
+- **Stack-Edu Python / smollm-corpus python-edu (Stage 1 breadth)** — both are *metadata-only* in HF streaming (rows expose `blob_id`/`path`/`score` but the actual code is fetched separately from S3). A 3M+ row streaming pass yields 0 usable samples.
+
+Using off-distribution data (e.g., KodCode, R1 traces) would shift the model away from its trained behavior — pure Ling-Coder is the safest choice.
 
 ## Scout run (optional but cheap insurance)
 
@@ -213,7 +217,7 @@ fast-pretrain/
 │   ├── ds_zero3.yaml       DeepSpeed ZeRO Stage 3 config
 │   └── acc_config          accelerate config
 └── src/
-    ├── data_prep.py        Pull Ling-Coder + Stack-Edu, write prompt+response
+    ├── data_prep.py        Pull Ling-Coder-SFT, write prompt+response
     ├── train.py            Dream-style trainer (q_sample biased, 4D attn, loss_mask, shift)
     └── eval_speed_quality.py  Benchmark across step counts
 ```

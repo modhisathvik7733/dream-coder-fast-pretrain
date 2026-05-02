@@ -8,15 +8,19 @@ Dream-Coder's actual training stages (from official repo):
   - Instruct (SFT):    inclusionAI/Ling-Coder-SFT (single dataset, 7 epochs)
   - RL:                Dream-org/Dream-Coder-RL-17k
 
-For continued pretraining (this script's purpose), we replay from the LATEST
-training stages so distribution shift is minimized:
-  90% Ling-Coder-SFT        (matches Stage 2 — what the instruct model was last trained on)
-  10% Stack-Edu Python      (some Stage 1 base coverage to preserve breadth)
+For continued pretraining (this script's purpose) we replay 100% Ling-Coder-SFT
+(Stage 2). Two other replay sources were tried and dropped:
 
-Dream-Coder-RL-17k was originally planned (matches Stage 3 distribution) but
-is dropped: it's a prompts-only RL dataset (no `response`/`solution`/`answer`
-field) — fundamentally incompatible with our masked-diffusion (prompt,
-response) training objective. The Stage 3 share is folded into Ling-Coder.
+  - Dream-Coder-RL-17k (Stage 3): prompts-only RL data — no `response`/
+    `solution`/`answer` field, incompatible with our (prompt, response)
+    masked-diffusion training objective.
+  - Stack-Edu Python / smollm-corpus python-edu (Stage 1 base breadth):
+    HF streaming returns metadata only (`blob_id`, `path`, `score`, ...) — the
+    actual code lives in S3 blobs that the dataset doesn't fetch on iteration.
+    A 3M+ row pass would yield 0 collected samples.
+
+Pure Ling-Coder is fine for our goal — preserving Dream-Coder-Instruct's
+Stage 2 SFT behaviour while shifting only the mask-ratio distribution.
 
 Output schema (matches Dream-Coder SFT convention — see sft_dataset.py):
     {
@@ -136,27 +140,6 @@ def tokenize_prompt_response(
     }
 
 
-def tokenize_raw_code(text: str, tokenizer, max_seq_length: int) -> dict | None:
-    """Tokenize raw code as a Stage 1 pretraining sample (no prompt prefix).
-
-    prompt_length = 0 means the whole sequence is maskable (= base pretraining).
-    """
-    ids = tokenizer(
-        text,
-        add_special_tokens=True,
-        truncation=True,
-        max_length=max_seq_length,
-    )
-    if len(ids.input_ids) < 64:
-        return None
-    return {
-        "input_ids": ids.input_ids,
-        "attention_mask": ids.attention_mask,
-        "prompt_length": 0,
-        "length": len(ids.input_ids),
-    }
-
-
 def collect_lingcoder(target: int, tokenizer, max_seq_length: int) -> list[dict]:
     """Primary replay source: Ling-Coder-SFT (Dream-Coder-Instruct's SFT data)."""
     print(f"Pulling Ling-Coder-SFT (target {target}) — Dream-Coder's actual SFT data ...")
@@ -182,42 +165,6 @@ def collect_lingcoder(target: int, tokenizer, max_seq_length: int) -> list[dict]
     return out
 
 
-def collect_stack_edu_python(target: int, tokenizer, max_seq_length: int) -> list[dict]:
-    """Tertiary replay: Stack-Edu Python — Stage 1 base adaptation data.
-
-    These are raw code samples (no chat structure) — treated as base pretraining
-    with prompt_length=0, so the whole sequence is maskable.
-    """
-    print(f"Pulling Stack-Edu Python (target {target}) — base adaptation data ...")
-    out = []
-    # Note: stack-edu config name is 'Python' (capital P); other valid configs:
-    # ['C', 'CSharp', 'Cpp', 'Go', 'Java', 'JavaScript', 'Markdown', 'PHP',
-    #  'Python', 'Ruby', 'Rust', 'SQL', 'Shell', 'Swift', 'TypeScript']
-    try:
-        ds = load_dataset("HuggingFaceTB/stack-edu", "Python", split="train", streaming=True)
-    except Exception as e:
-        print(f"  Stack-Edu Python load failed: {e} — trying alternative")
-        try:
-            ds = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train", streaming=True)
-        except Exception as e2:
-            print(f"  Alternative also failed: {e2}")
-            return out
-
-    for row in tqdm(ds, desc="stack-edu-py"):
-        text = row.get("text") or row.get("content") or row.get("code")
-        if not isinstance(text, str):
-            continue
-        if len(text) < 200 or len(text) > 4000:
-            continue
-        item = tokenize_raw_code(text, tokenizer, max_seq_length)
-        if item:
-            out.append(item)
-        if len(out) >= target:
-            break
-    print(f"  Collected {len(out)} Stack-Edu Python samples")
-    return out
-
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--output_dir", type=Path, required=True)
@@ -232,20 +179,18 @@ def main():
     print(f"Loading tokenizer: {args.tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
-    # Distribution matched to Dream-Coder's training stages:
-    # 90% Ling-Coder-SFT (Stage 2 — what the instruct model was last trained on)
-    # 10% Stack-Edu Python (Stage 1 base coverage)
+    # 100% Ling-Coder-SFT (Stage 2 — the dataset that produced the instruct model).
     #
-    # Dream-Coder-RL-17k was originally planned for Stage 3 replay, but it's
-    # an RL prompts-only dataset (no responses) — fundamentally incompatible
-    # with our (prompt, response)-pair masked-diffusion training objective.
-    # Dropped; budget redistributed to Ling-Coder.
-    n_ling = int(args.target_samples * 0.90)
-    n_stack = args.target_samples - n_ling
-
-    samples = []
-    samples.extend(collect_lingcoder(n_ling, tokenizer, args.max_seq_length))
-    samples.extend(collect_stack_edu_python(n_stack, tokenizer, args.max_seq_length))
+    # Two other replay sources were planned but dropped:
+    #   - Dream-Coder-RL-17k (Stage 3): prompts-only, no responses, incompatible
+    #     with our (prompt, response) masked-diffusion training objective.
+    #   - Stack-Edu Python / smollm-corpus python-edu (Stage 1 breadth):
+    #     metadata-only in HF streaming mode (the actual code lives in S3 blobs
+    #     keyed by `blob_id`); the code field doesn't exist in the rows.
+    #
+    # Pure Ling-Coder is fine for our goal — preserving Dream-Coder-Instruct's
+    # Stage 2 SFT behaviour while shifting only the mask-ratio distribution.
+    samples = collect_lingcoder(args.target_samples, tokenizer, args.max_seq_length)
 
     if not samples:
         print("ERROR: no samples collected from any source.")
@@ -275,20 +220,20 @@ def main():
         "max_seq_length": args.max_seq_length,
         "avg_length": total_tokens / max(1, len(samples)),
         "data_mix": {
-            "ling-coder-sft": 0.90,
-            "stack-edu-python": 0.10,
+            "ling-coder-sft": 1.00,
         },
         "rationale": (
-            "Stage 2 SFT replay (Ling-Coder-SFT, the dataset the instruct model "
-            "was actually trained on) plus a small Stage 1 base-pretraining tail "
-            "(Stack-Edu Python). Dream-Coder-RL-17k is excluded because it's a "
-            "prompts-only RL dataset with no responses — incompatible with our "
-            "(prompt, response) masked-diffusion training objective."
+            "100% Stage 2 SFT replay (Ling-Coder-SFT, the dataset that produced "
+            "Dream-Coder-Instruct). Dream-Coder-RL-17k (Stage 3) is excluded — "
+            "it's prompts-only, incompatible with our (prompt, response) "
+            "masked-diffusion training objective. Stack-Edu / smollm-corpus "
+            "python-edu (Stage 1 breadth) is excluded — both are metadata-only "
+            "in HF streaming mode (code lives in S3 blobs by `blob_id`)."
         ),
         "schema": {
             "input_ids": "list[int] — prompt tokens followed by response tokens",
             "attention_mask": "list[int] — all 1s (Dream convention; padding handled by collator)",
-            "prompt_length": "int — # tokens of the prompt prefix; 0 for raw-code samples",
+            "prompt_length": "int — # tokens of the prompt prefix",
             "length": "int — total tokens (prompt + response)",
         },
     }
