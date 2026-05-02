@@ -10,9 +10,13 @@ Dream-Coder's actual training stages (from official repo):
 
 For continued pretraining (this script's purpose), we replay from the LATEST
 training stages so distribution shift is minimized:
-  70% Ling-Coder-SFT        (matches Stage 2 — what the instruct model was last trained on)
-  20% Dream-Coder-RL-17k    (matches Stage 3 — RL prompt distribution)
+  90% Ling-Coder-SFT        (matches Stage 2 — what the instruct model was last trained on)
   10% Stack-Edu Python      (some Stage 1 base coverage to preserve breadth)
+
+Dream-Coder-RL-17k was originally planned (matches Stage 3 distribution) but
+is dropped: it's a prompts-only RL dataset (no `response`/`solution`/`answer`
+field) — fundamentally incompatible with our masked-diffusion (prompt,
+response) training objective. The Stage 3 share is folded into Ling-Coder.
 
 Output schema (matches Dream-Coder SFT convention — see sft_dataset.py):
     {
@@ -178,44 +182,6 @@ def collect_lingcoder(target: int, tokenizer, max_seq_length: int) -> list[dict]
     return out
 
 
-def collect_dream_rl(target: int, tokenizer, max_seq_length: int) -> list[dict]:
-    """Secondary replay: Dream-Coder-RL-17k (the RL stage data)."""
-    print(f"Pulling Dream-Coder-RL-17k (target {target}) — RL stage data ...")
-    out = []
-    try:
-        ds = load_dataset("Dream-org/Dream-Coder-RL-17k", split="train", streaming=True)
-    except Exception as e:
-        print(f"  Dream-Coder-RL-17k load failed: {e}")
-        return out
-
-    for row in tqdm(ds, desc="dream-coder-rl"):
-        # RL data may have varying schema. Try common fields.
-        messages = row.get("messages")
-        prompt_field = row.get("prompt")
-        response = row.get("response") or row.get("solution") or row.get("answer")
-
-        split = None
-        if isinstance(messages, list):
-            split = split_messages_to_prompt_response(messages)
-        elif isinstance(prompt_field, str) and isinstance(response, str):
-            fake_msgs = [
-                {"role": "user", "content": prompt_field},
-                {"role": "assistant", "content": response},
-            ]
-            split = split_messages_to_prompt_response(fake_msgs)
-
-        if split is None:
-            continue
-        prompt_msgs, resp = split
-        item = tokenize_prompt_response(prompt_msgs, resp, tokenizer, max_seq_length)
-        if item:
-            out.append(item)
-        if len(out) >= target:
-            break
-    print(f"  Collected {len(out)} Dream-Coder-RL samples")
-    return out
-
-
 def collect_stack_edu_python(target: int, tokenizer, max_seq_length: int) -> list[dict]:
     """Tertiary replay: Stack-Edu Python — Stage 1 base adaptation data.
 
@@ -224,8 +190,11 @@ def collect_stack_edu_python(target: int, tokenizer, max_seq_length: int) -> lis
     """
     print(f"Pulling Stack-Edu Python (target {target}) — base adaptation data ...")
     out = []
+    # Note: stack-edu config name is 'Python' (capital P); other valid configs:
+    # ['C', 'CSharp', 'Cpp', 'Go', 'Java', 'JavaScript', 'Markdown', 'PHP',
+    #  'Python', 'Ruby', 'Rust', 'SQL', 'Shell', 'Swift', 'TypeScript']
     try:
-        ds = load_dataset("HuggingFaceTB/stack-edu", "python", split="train", streaming=True)
+        ds = load_dataset("HuggingFaceTB/stack-edu", "Python", split="train", streaming=True)
     except Exception as e:
         print(f"  Stack-Edu Python load failed: {e} — trying alternative")
         try:
@@ -264,16 +233,18 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
     # Distribution matched to Dream-Coder's training stages:
-    # 70% Ling-Coder-SFT (Stage 2 — most recent)
-    # 20% Dream-Coder-RL-17k (Stage 3)
+    # 90% Ling-Coder-SFT (Stage 2 — what the instruct model was last trained on)
     # 10% Stack-Edu Python (Stage 1 base coverage)
-    n_ling = int(args.target_samples * 0.70)
-    n_rl = int(args.target_samples * 0.20)
-    n_stack = args.target_samples - n_ling - n_rl
+    #
+    # Dream-Coder-RL-17k was originally planned for Stage 3 replay, but it's
+    # an RL prompts-only dataset (no responses) — fundamentally incompatible
+    # with our (prompt, response)-pair masked-diffusion training objective.
+    # Dropped; budget redistributed to Ling-Coder.
+    n_ling = int(args.target_samples * 0.90)
+    n_stack = args.target_samples - n_ling
 
     samples = []
     samples.extend(collect_lingcoder(n_ling, tokenizer, args.max_seq_length))
-    samples.extend(collect_dream_rl(n_rl, tokenizer, args.max_seq_length))
     samples.extend(collect_stack_edu_python(n_stack, tokenizer, args.max_seq_length))
 
     if not samples:
@@ -304,14 +275,15 @@ def main():
         "max_seq_length": args.max_seq_length,
         "avg_length": total_tokens / max(1, len(samples)),
         "data_mix": {
-            "ling-coder-sft": 0.70,
-            "dream-coder-rl-17k": 0.20,
+            "ling-coder-sft": 0.90,
             "stack-edu-python": 0.10,
         },
         "rationale": (
-            "Matches Dream-Coder's actual training distribution (Stage 2 SFT + "
-            "Stage 3 RL + Stage 1 base coverage). Using off-distribution data "
-            "would shift the model and degrade original capabilities."
+            "Stage 2 SFT replay (Ling-Coder-SFT, the dataset the instruct model "
+            "was actually trained on) plus a small Stage 1 base-pretraining tail "
+            "(Stack-Edu Python). Dream-Coder-RL-17k is excluded because it's a "
+            "prompts-only RL dataset with no responses — incompatible with our "
+            "(prompt, response) masked-diffusion training objective."
         ),
         "schema": {
             "input_ids": "list[int] — prompt tokens followed by response tokens",
