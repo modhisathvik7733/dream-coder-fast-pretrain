@@ -43,6 +43,12 @@ if [ "${DISK_FREE_GB:-0}" -lt 50 ]; then
     echo "  Recommend: clear /workspace/data/cache or other temp files before continuing."
 fi
 
+# Read the ACTUAL batch / accum values from training.yaml so the banner doesn't lie.
+PER_DEV_BATCH=$(grep -E '^[[:space:]]*per_device_batch_size:' "$SCRIPT_DIR/configs/training.yaml" | awk '{print $2}')
+GRAD_ACCUM=$(grep -E '^[[:space:]]*gradient_accumulation_steps:' "$SCRIPT_DIR/configs/training.yaml" | awk '{print $2}')
+GRAD_CKPT=$(grep -E '^[[:space:]]*gradient_checkpointing:' "$SCRIPT_DIR/configs/training.yaml" | awk '{print $2}')
+EFF_BATCH=$(( PER_DEV_BATCH * GRAD_ACCUM ))
+
 echo
 echo "=== Continued pretraining: Dream-Coder for low-step decoding ==="
 echo "  Hardware: 1× A100 SXM 80GB (single GPU, no DeepSpeed)"
@@ -50,9 +56,16 @@ echo "  Target: 4 denoising steps per 32-token block (vs 32 baseline)"
 echo "  Method: q_sample-style biased masking (bias=0.3, favors high-mask)"
 echo "  Conventions: Dream-Coder SFT trainer verbatim — 4D attention mask,"
 echo "               position_ids, loss_mask=response-only, shifted logits."
-echo "  Effective batch: 64 (1 GPU × 1 batch × 64 grad_accum)"
-echo "  Samples: 50k × ~600 avg tokens = ~30M tokens"
-echo "  Expected duration: ~12-20 hours"
+echo "  Effective batch: ${EFF_BATCH} (1 GPU × ${PER_DEV_BATCH} batch × ${GRAD_ACCUM} grad_accum)"
+echo "  gradient_checkpointing: ${GRAD_CKPT}"
+echo "  Samples: 50k × ~700 avg tokens = ~35M tokens"
+echo
+if [ "${EFF_BATCH}" -ne 64 ]; then
+    echo "  WARNING: effective batch is ${EFF_BATCH}, not 64."
+    echo "  Scout was validated at effective batch 64. Quality may differ."
+    echo "  Press Ctrl-C now to bail and adjust, or wait 10s to continue."
+    sleep 10
+fi
 echo
 
 START_TIME=$(date +%s)
