@@ -64,18 +64,22 @@ def run_test(code: str, test_code: str, entry_point: str, timeout: int = 10) -> 
         return False
 
 
-# Same 8 diverse configs that worked for DiffuCoder & Dream-Coder.
-# Step counts (256, 128) are multiples of (max_new_tokens / block_length) = 8 — required
-# by fast_dllm's block scheduler.
+# 8 diverse configs. We use `steps_per_block` (not raw `steps`) so the configs
+# work for any max_new_tokens that divides BLOCK_LENGTH evenly. fast_dllm's
+# block scheduler requires `total_steps % num_blocks == 0`; computing total from
+# steps_per_block × num_blocks guarantees that automatically.
+#
+#   steps_per_block=32 → "full quality" pass (was steps=256 with 8 blocks)
+#   steps_per_block=16 → "fast" pass         (was steps=128 with 8 blocks)
 DIVERSE_CONFIGS = [
-    {"alg": "entropy",      "alg_temp": 0.0, "temperature": 0.2, "top_p": 0.95, "steps": 256},
-    {"alg": "entropy",      "alg_temp": 0.0, "temperature": 0.5, "top_p": 0.95, "steps": 256},
-    {"alg": "entropy",      "alg_temp": 0.3, "temperature": 0.7, "top_p": 0.95, "steps": 128},
-    {"alg": "entropy",      "alg_temp": 0.5, "temperature": 0.9, "top_p": 0.92, "steps": 128},
-    {"alg": "maskgit_plus", "alg_temp": 0.0, "temperature": 0.4, "top_p": 0.95, "steps": 256},
-    {"alg": "maskgit_plus", "alg_temp": 0.3, "temperature": 0.7, "top_p": 0.95, "steps": 128},
-    {"alg": "topk_margin",  "alg_temp": 0.0, "temperature": 0.4, "top_p": 0.95, "steps": 256},
-    {"alg": "topk_margin",  "alg_temp": 0.3, "temperature": 0.7, "top_p": 0.95, "steps": 128},
+    {"alg": "entropy",      "alg_temp": 0.0, "temperature": 0.2, "top_p": 0.95, "steps_per_block": 32},
+    {"alg": "entropy",      "alg_temp": 0.0, "temperature": 0.5, "top_p": 0.95, "steps_per_block": 32},
+    {"alg": "entropy",      "alg_temp": 0.3, "temperature": 0.7, "top_p": 0.95, "steps_per_block": 16},
+    {"alg": "entropy",      "alg_temp": 0.5, "temperature": 0.9, "top_p": 0.92, "steps_per_block": 16},
+    {"alg": "maskgit_plus", "alg_temp": 0.0, "temperature": 0.4, "top_p": 0.95, "steps_per_block": 32},
+    {"alg": "maskgit_plus", "alg_temp": 0.3, "temperature": 0.7, "top_p": 0.95, "steps_per_block": 16},
+    {"alg": "topk_margin",  "alg_temp": 0.0, "temperature": 0.4, "top_p": 0.95, "steps_per_block": 32},
+    {"alg": "topk_margin",  "alg_temp": 0.3, "temperature": 0.7, "top_p": 0.95, "steps_per_block": 16},
 ]
 
 
@@ -137,18 +141,21 @@ def setup_fast_dllm_model(dream_repo: Path, model_path: str, use_compile: bool, 
             print("Continuing without compile.")
 
     # Warmup with a representative config so the cache + (optional) compile graph are hot.
+    # NOTE: steps must be a multiple of num_blocks = max_new_tokens / block_length.
     print("Warming up ...")
     warmup_messages = [{"role": "user", "content": "Write add(a,b)."}]
     warmup_inp = tokenizer.apply_chat_template(
         warmup_messages, return_tensors="pt", return_dict=True,
         add_generation_prompt=True,
     )
+    warmup_max_new = 256  # 8 blocks of 32
+    warmup_steps = 16 * (warmup_max_new // BLOCK_LENGTH)  # 16 steps/block × 8 = 128
     t0 = time.time()
     with torch.no_grad():
         _ = model.diffusion_generate(
             warmup_inp.input_ids.to("cuda"),
             attention_mask=warmup_inp.attention_mask.to("cuda"),
-            max_new_tokens=256, steps=128,
+            max_new_tokens=warmup_max_new, steps=warmup_steps,
             temperature=0.2, top_p=0.95, alg="entropy", alg_temp=0.0,
             dual_cache=True, block_length=BLOCK_LENGTH, threshold=THRESHOLD,
         )
@@ -158,6 +165,19 @@ def setup_fast_dllm_model(dream_repo: Path, model_path: str, use_compile: bool, 
 
 
 def evaluate(tokenizer, model, items, max_new_tokens: int):
+    # Precompute total steps from each config's steps_per_block. fast_dllm requires
+    # steps % num_blocks == 0 — guaranteed when steps = steps_per_block × num_blocks.
+    assert max_new_tokens % BLOCK_LENGTH == 0, (
+        f"max_new_tokens ({max_new_tokens}) must be a multiple of "
+        f"BLOCK_LENGTH ({BLOCK_LENGTH})"
+    )
+    num_blocks = max_new_tokens // BLOCK_LENGTH
+    resolved_configs = []
+    for cfg in DIVERSE_CONFIGS:
+        resolved = {k: v for k, v in cfg.items() if k != "steps_per_block"}
+        resolved["steps"] = cfg["steps_per_block"] * num_blocks
+        resolved_configs.append(resolved)
+
     results = []
     n_pass = 0
     attempts_used = []
@@ -182,7 +202,7 @@ def evaluate(tokenizer, model, items, max_new_tokens: int):
         found = False
         used = 0
 
-        for j, cfg in enumerate(DIVERSE_CONFIGS):
+        for j, cfg in enumerate(resolved_configs):
             used = j + 1
             with torch.no_grad():
                 out = model.diffusion_generate(
