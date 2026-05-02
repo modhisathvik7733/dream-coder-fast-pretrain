@@ -16,6 +16,24 @@ if [ ! -f "$WORKSPACE/data/train.jsonl" ]; then
     exit 1
 fi
 
+# Schema check — old data without prompt_length will fail silently otherwise.
+python3 - <<'PY' || { echo "Re-run: bash 01_prepare_data.sh"; exit 1; }
+import json, sys
+with open("/workspace/data/train.jsonl") as f:
+    sample = json.loads(f.readline())
+required = {"input_ids", "attention_mask", "prompt_length", "length"}
+missing = required - set(sample.keys())
+if missing:
+    print(f"ERROR: train.jsonl missing fields {missing}.")
+    sys.exit(1)
+PY
+
+# Strongly suggest the smoke test if it hasn't been run.
+echo "REMINDER: have you run 'bash 01b_smoke_train.sh' yet?"
+echo "  It catches pipeline bugs in 5 minutes instead of 12 hours."
+echo "  Press Ctrl-C now to bail out, or wait 10s to continue."
+sleep 10
+
 # Disk space check (training will save ~14GB checkpoints)
 DISK_FREE_GB=$(df -BG /workspace 2>/dev/null | awk 'NR==2 {print $4}' | tr -d 'G' || echo "0")
 echo "Disk free: ${DISK_FREE_GB}GB"
@@ -29,8 +47,9 @@ echo
 echo "=== Continued pretraining: Dream-Coder for low-step decoding ==="
 echo "  Hardware: 1× A100 SXM 80GB (single GPU, no DeepSpeed)"
 echo "  Target: 4 denoising steps per 32-token block (vs 32 baseline)"
-echo "  Method: standard CE loss with biased mask ratio (bias=0.3, favors high-mask)"
-echo "  Includes: Dream-style logit shift (verified from generation_utils.py line 413)"
+echo "  Method: q_sample-style biased masking (bias=0.3, favors high-mask)"
+echo "  Conventions: Dream-Coder SFT trainer verbatim — 4D attention mask,"
+echo "               position_ids, loss_mask=response-only, shifted logits."
 echo "  Effective batch: 64 (1 GPU × 1 batch × 64 grad_accum)"
 echo "  Samples: 50k × ~600 avg tokens = ~30M tokens"
 echo "  Expected duration: ~12-20 hours"

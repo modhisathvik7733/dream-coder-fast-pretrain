@@ -43,8 +43,9 @@ git clone https://github.com/<your_user>/<this_repo>.git
 cd <this_repo>/fast-pretrain
 
 bash 00_setup.sh          # ~10 min — install deps + download Dream-Coder-Instruct
-bash 01_prepare_data.sh   # ~30 min — pull KodCode + OpenCodeReasoning + format
-bash 02_train.sh          # ~50-90 hours — continued pretraining
+bash 01_prepare_data.sh   # ~30 min — pull Ling-Coder-SFT + Dream-RL-17k + Stack-Edu-Py
+bash 01b_smoke_train.sh   # ~5-10 min — 5-step pipeline check (RUN THIS BEFORE 02_train.sh)
+bash 02_train.sh          # ~12-20 hours — continued pretraining
 bash 03_validate.sh       # ~30 min — multi-step-count benchmark
 ```
 
@@ -86,6 +87,21 @@ data:
 - **Stage 3 (RL):** `Dream-org/Dream-Coder-RL-17k` with verifiable sandbox rewards
 
 We replay from Stage 2+3 primarily (most recent) plus a small Stage 1 sample for breadth. Using off-distribution data (e.g., KodCode, R1 traces) would shift the model away from its trained behavior.
+
+## Smoke test (mandatory before the long run)
+
+`01b_smoke_train.sh` runs 5 training steps end-to-end so you can catch pipeline
+bugs in ~5 min instead of in hour 12 of the real run. It checks:
+
+- tokenizer + `<|mask|>` id resolution (151666)
+- dataset schema has `prompt_length` (re-run `01_prepare_data.sh` if not)
+- model.forward accepts 4D attention mask + position_ids
+- 8-bit Adam loads (bitsandbytes)
+- bf16 + gradient checkpointing fits in 80 GB
+- loss is finite, in a reasonable range, and not NaN
+- step wall-clock matches the 12-20h projection
+
+Always run it before `02_train.sh`. Output is auto-cleaned up.
 
 ## Method explained
 
@@ -167,6 +183,7 @@ fast-pretrain/
 ├── README.md
 ├── 00_setup.sh             Environment + model download
 ├── 01_prepare_data.sh      Dataset preparation launcher
+├── 01b_smoke_train.sh      5-step smoke test (run before 02)
 ├── 02_train.sh             Training launcher
 ├── 03_validate.sh          Multi-step-count benchmark
 ├── monitor.sh              tmux session helper
@@ -175,8 +192,8 @@ fast-pretrain/
 │   ├── ds_zero3.yaml       DeepSpeed ZeRO Stage 3 config
 │   └── acc_config          accelerate config
 └── src/
-    ├── data_prep.py        Pull KodCode + OpenCodeReasoning + format
-    ├── train.py            Custom Trainer with biased-mask diffusion loss
+    ├── data_prep.py        Pull Ling-Coder + Dream-RL + Stack-Edu, write prompt+response
+    ├── train.py            Dream-style trainer (q_sample biased, 4D attn, loss_mask, shift)
     └── eval_speed_quality.py  Benchmark across step counts
 ```
 

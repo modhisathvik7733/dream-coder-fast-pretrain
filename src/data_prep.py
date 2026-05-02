@@ -12,10 +12,22 @@ For continued pretraining (this script's purpose), we replay from the LATEST
 training stages so distribution shift is minimized:
   70% Ling-Coder-SFT        (matches Stage 2 — what the instruct model was last trained on)
   20% Dream-Coder-RL-17k    (matches Stage 3 — RL prompt distribution)
-  10% Stack v2 subset       (some base coverage to preserve breadth)
+  10% Stack-Edu Python      (some Stage 1 base coverage to preserve breadth)
 
-This way our biased-mask training applies to data the model already knows,
-purely teaching it to handle high-mask cases on familiar content.
+Output schema (matches Dream-Coder SFT convention — see sft_dataset.py):
+    {
+      "input_ids":     [prompt_tokens..., response_tokens...],
+      "attention_mask":[1, 1, ..., 1],
+      "prompt_length": <int — # of tokens belonging to the prompt prefix>,
+      "length":        <int — total tokens>
+    }
+
+train.py uses prompt_length to build a loss_mask that is 0 on the prompt+pad
+positions and 1 on response positions. Only response positions are eligible
+to be masked + contribute to the diffusion loss.
+
+For raw-code samples (Stack-Edu), prompt_length = 0 — the entire sequence is
+"response", matching Stage 1 base pretraining where everything is maskable.
 """
 from __future__ import annotations
 
@@ -29,34 +41,102 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 
-def format_messages_to_text(messages: list, max_chars: int = 4000) -> str | None:
-    """Concatenate a multi-turn conversation into a single text string.
+def split_messages_to_prompt_response(messages: list) -> tuple[list, str] | None:
+    """Split a multi-turn conversation into (prompt_messages, response_str).
 
-    Filters: must end with assistant message, total length within bounds.
+    Last assistant turn becomes the response; everything before is the prompt
+    (we'll apply the chat template with add_generation_prompt=True).
     """
     if not isinstance(messages, list) or len(messages) < 2:
         return None
-    if messages[-1].get("role", "").lower() != "assistant":
-        return None
 
-    parts = []
+    norm = []
     for m in messages:
-        role = m.get("role", "").lower()
+        if not isinstance(m, dict):
+            return None
+        role = (m.get("role") or "").lower()
         if role == "human":
             role = "user"
-        content = m.get("content", "")
-        if not isinstance(content, str):
+        content = m.get("content")
+        if not isinstance(content, str) or not content:
             return None
-        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
-    text = "\n".join(parts)
+        norm.append({"role": role, "content": content})
 
-    if len(text) < 100 or len(text) > max_chars:
+    # Find the last assistant turn
+    last_asst_idx = None
+    for i in range(len(norm) - 1, -1, -1):
+        if norm[i]["role"] == "assistant":
+            last_asst_idx = i
+            break
+    if last_asst_idx is None or last_asst_idx == 0:
         return None
-    return text
+
+    prompt_messages = norm[:last_asst_idx]
+    response_str = norm[last_asst_idx]["content"]
+    if not response_str.strip():
+        return None
+    return prompt_messages, response_str
 
 
-def tokenize_to_sample(text: str, tokenizer, max_seq_length: int) -> dict | None:
-    """Tokenize text to (input_ids, attention_mask) within seq length."""
+def tokenize_prompt_response(
+    prompt_messages: list,
+    response_str: str,
+    tokenizer,
+    max_seq_length: int,
+) -> dict | None:
+    """Tokenize prompt+response, returning the schema train.py expects.
+
+    Mirrors Dream-Coder's `sft_dataset.py::_tokenize_static`:
+      - prompt = chat_template(prompt_messages, add_generation_prompt=True)
+      - response = response_str + eos
+      - input_ids = prompt_ids ++ response_ids
+      - attention_mask = all ones
+      - prompt_length = len(prompt_ids)
+    """
+    try:
+        prompt_str = tokenizer.apply_chat_template(
+            prompt_messages, add_generation_prompt=True, tokenize=False
+        )
+    except Exception:
+        return None
+
+    eos = tokenizer.eos_token or ""
+    response_full = response_str + eos
+
+    prompt_ids = tokenizer(
+        prompt_str, add_special_tokens=False, truncation=False
+    ).input_ids
+    response_ids = tokenizer(
+        response_full, add_special_tokens=False, truncation=False
+    ).input_ids
+
+    if len(prompt_ids) < 4 or len(response_ids) < 4:
+        return None
+
+    total = len(prompt_ids) + len(response_ids)
+    if total > max_seq_length:
+        # Right-truncate the response (preserve full prompt) — Dream's SFT does this implicitly
+        budget = max_seq_length - len(prompt_ids)
+        if budget < 8:
+            return None  # prompt too long, skip
+        response_ids = response_ids[:budget]
+        total = len(prompt_ids) + len(response_ids)
+    if total < 32:
+        return None
+
+    return {
+        "input_ids": prompt_ids + response_ids,
+        "attention_mask": [1] * total,
+        "prompt_length": len(prompt_ids),
+        "length": total,
+    }
+
+
+def tokenize_raw_code(text: str, tokenizer, max_seq_length: int) -> dict | None:
+    """Tokenize raw code as a Stage 1 pretraining sample (no prompt prefix).
+
+    prompt_length = 0 means the whole sequence is maskable (= base pretraining).
+    """
     ids = tokenizer(
         text,
         add_special_tokens=True,
@@ -68,6 +148,7 @@ def tokenize_to_sample(text: str, tokenizer, max_seq_length: int) -> dict | None
     return {
         "input_ids": ids.input_ids,
         "attention_mask": ids.attention_mask,
+        "prompt_length": 0,
         "length": len(ids.input_ids),
     }
 
@@ -84,10 +165,11 @@ def collect_lingcoder(target: int, tokenizer, max_seq_length: int) -> list[dict]
 
     for row in tqdm(ds, desc="ling-coder-sft"):
         messages = row.get("messages")
-        text = format_messages_to_text(messages)
-        if not text:
+        split = split_messages_to_prompt_response(messages)
+        if split is None:
             continue
-        item = tokenize_to_sample(text, tokenizer, max_seq_length)
+        prompt_msgs, resp = split
+        item = tokenize_prompt_response(prompt_msgs, resp, tokenizer, max_seq_length)
         if item:
             out.append(item)
         if len(out) >= target:
@@ -108,22 +190,24 @@ def collect_dream_rl(target: int, tokenizer, max_seq_length: int) -> list[dict]:
 
     for row in tqdm(ds, desc="dream-coder-rl"):
         # RL data may have varying schema. Try common fields.
-        messages = row.get("messages") or row.get("prompt")
+        messages = row.get("messages")
+        prompt_field = row.get("prompt")
         response = row.get("response") or row.get("solution") or row.get("answer")
 
-        text = None
-        if messages and isinstance(messages, list):
-            text = format_messages_to_text(messages)
-        elif messages and isinstance(messages, str) and response:
-            full = [
-                {"role": "user", "content": messages},
-                {"role": "assistant", "content": response if isinstance(response, str) else str(response)},
+        split = None
+        if isinstance(messages, list):
+            split = split_messages_to_prompt_response(messages)
+        elif isinstance(prompt_field, str) and isinstance(response, str):
+            fake_msgs = [
+                {"role": "user", "content": prompt_field},
+                {"role": "assistant", "content": response},
             ]
-            text = format_messages_to_text(full)
+            split = split_messages_to_prompt_response(fake_msgs)
 
-        if not text:
+        if split is None:
             continue
-        item = tokenize_to_sample(text, tokenizer, max_seq_length)
+        prompt_msgs, resp = split
+        item = tokenize_prompt_response(prompt_msgs, resp, tokenizer, max_seq_length)
         if item:
             out.append(item)
         if len(out) >= target:
@@ -132,22 +216,19 @@ def collect_dream_rl(target: int, tokenizer, max_seq_length: int) -> list[dict]:
     return out
 
 
-def collect_stack_v2_python(target: int, tokenizer, max_seq_length: int) -> list[dict]:
-    """Tertiary replay: Stack v2 Python subset for breadth.
+def collect_stack_edu_python(target: int, tokenizer, max_seq_length: int) -> list[dict]:
+    """Tertiary replay: Stack-Edu Python — Stage 1 base adaptation data.
 
-    We use the smol variant Dream-Coder used during base adaptation.
-    Note: full The Stack v2 needs auth + license attestation. Using a public proxy
-    or stack-edu-py which is openly available.
+    These are raw code samples (no chat structure) — treated as base pretraining
+    with prompt_length=0, so the whole sequence is maskable.
     """
     print(f"Pulling Stack-Edu Python (target {target}) — base adaptation data ...")
     out = []
     try:
-        # Stack-Edu Python — same one Dream-Coder used in base adaptation
         ds = load_dataset("HuggingFaceTB/stack-edu", "python", split="train", streaming=True)
     except Exception as e:
         print(f"  Stack-Edu Python load failed: {e} — trying alternative")
         try:
-            # Fallback: code subset of fineweb-edu equivalent
             ds = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train", streaming=True)
         except Exception as e2:
             print(f"  Alternative also failed: {e2}")
@@ -159,7 +240,7 @@ def collect_stack_v2_python(target: int, tokenizer, max_seq_length: int) -> list
             continue
         if len(text) < 200 or len(text) > 4000:
             continue
-        item = tokenize_to_sample(text, tokenizer, max_seq_length)
+        item = tokenize_raw_code(text, tokenizer, max_seq_length)
         if item:
             out.append(item)
         if len(out) >= target:
@@ -193,7 +274,7 @@ def main():
     samples = []
     samples.extend(collect_lingcoder(n_ling, tokenizer, args.max_seq_length))
     samples.extend(collect_dream_rl(n_rl, tokenizer, args.max_seq_length))
-    samples.extend(collect_stack_v2_python(n_stack, tokenizer, args.max_seq_length))
+    samples.extend(collect_stack_edu_python(n_stack, tokenizer, args.max_seq_length))
 
     if not samples:
         print("ERROR: no samples collected from any source.")
@@ -209,14 +290,17 @@ def main():
             f.write(json.dumps(sample) + "\n")
 
     total_tokens = sum(s["length"] for s in samples)
+    total_response_tokens = sum(s["length"] - s["prompt_length"] for s in samples)
     print()
     print(f"Wrote {len(samples)} samples to {out_path}")
-    print(f"Total tokens: {total_tokens:,}  (~{total_tokens/1e6:.1f}M)")
-    print(f"Avg length: {total_tokens / max(1, len(samples)):.0f} tokens")
+    print(f"Total tokens:    {total_tokens:,}  (~{total_tokens/1e6:.1f}M)")
+    print(f"Response tokens: {total_response_tokens:,}  (~{total_response_tokens/1e6:.1f}M maskable)")
+    print(f"Avg length:      {total_tokens / max(1, len(samples)):.0f} tokens")
 
     meta = {
         "n_samples": len(samples),
         "total_tokens": total_tokens,
+        "total_response_tokens": total_response_tokens,
         "max_seq_length": args.max_seq_length,
         "avg_length": total_tokens / max(1, len(samples)),
         "data_mix": {
@@ -229,6 +313,12 @@ def main():
             "Stage 3 RL + Stage 1 base coverage). Using off-distribution data "
             "would shift the model and degrade original capabilities."
         ),
+        "schema": {
+            "input_ids": "list[int] — prompt tokens followed by response tokens",
+            "attention_mask": "list[int] — all 1s (Dream convention; padding handled by collator)",
+            "prompt_length": "int — # tokens of the prompt prefix; 0 for raw-code samples",
+            "length": "int — total tokens (prompt + response)",
+        },
     }
     (args.output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 
