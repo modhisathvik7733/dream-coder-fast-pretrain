@@ -84,19 +84,42 @@ BLOCK_LENGTH = 32
 THRESHOLD = 0.9
 
 
-def setup_fast_dllm_model(dream_repo: Path, model_path: str, use_compile: bool):
-    """Load model via fast_dllm DreamModel + monkey-patch + warmup."""
+def setup_fast_dllm_model(dream_repo: Path, model_path: str, use_compile: bool, quant: str):
+    """Load model via fast_dllm DreamModel + optional quantization + monkey-patch + warmup."""
     sys.path.insert(0, str(dream_repo / "instruct"))
     from src.inference.fast_dllm.modeling_dream import DreamModel  # noqa: E402
     from src.inference.fast_dllm.generation_utils_block import (  # noqa: E402
         DreamGenerationMixin,
     )
 
-    print(f"Loading {model_path} via fast_dllm DreamModel ...")
+    print(f"Loading {model_path} via fast_dllm DreamModel "
+          f"(quant={quant or 'bf16'}) ...")
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = DreamModel.from_pretrained(
-        model_path, torch_dtype=torch.bfloat16
-    ).to("cuda").eval()
+
+    load_kwargs: dict = {"torch_dtype": torch.bfloat16}
+    needs_to_cuda = True
+
+    if quant == "int8":
+        from transformers import BitsAndBytesConfig  # noqa: E402
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+        # bitsandbytes places weights on cuda automatically — don't .to() afterward
+        needs_to_cuda = False
+        load_kwargs.pop("torch_dtype")  # bnb manages dtype
+    elif quant == "int4":
+        from transformers import BitsAndBytesConfig  # noqa: E402
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_use_double_quant=True,
+        )
+        needs_to_cuda = False
+        load_kwargs.pop("torch_dtype")
+
+    model = DreamModel.from_pretrained(model_path, **load_kwargs)
+    if needs_to_cuda:
+        model = model.to("cuda")
+    model = model.eval()
     print(f"Loaded. VRAM: {torch.cuda.memory_allocated()/1e9:.1f} GB")
 
     # Bind block-aware diffusion_generate (the path that supports dual_cache).
@@ -200,7 +223,14 @@ def main():
     ap.add_argument("--model_path", type=str,
                     default="/workspace/models/dream-coder-7b-instruct",
                     help="Local path or HF repo id of a Dream-architecture model.")
-    ap.add_argument("--max_new_tokens", type=int, default=256)
+    ap.add_argument("--max_new_tokens", type=int, default=256,
+                    help="Lower = faster (linear). 192 typically still passes most "
+                         "HumanEval+ problems; 256 covers all. Try 192 for a free 25%% speedup.")
+    ap.add_argument("--quant", type=str, default="",
+                    choices=["", "int8", "int4"],
+                    help="Quantization: '' (bf16, default), 'int8' (~1.5-2x faster, "
+                         "~-2 pts pass@1), 'int4' (~2-3x faster, ~-4 pts pass@1). "
+                         "Requires bitsandbytes installed.")
     ap.add_argument("--limit", type=int, default=0,
                     help="Evaluate only the first N HumanEval+ problems (0 = all 164).")
     ap.add_argument("--no-compile", dest="use_compile", action="store_false", default=True,
@@ -210,7 +240,7 @@ def main():
     args = ap.parse_args()
 
     tokenizer, model = setup_fast_dllm_model(
-        args.dream_repo, args.model_path, args.use_compile
+        args.dream_repo, args.model_path, args.use_compile, args.quant
     )
 
     items = list(get_human_eval_plus().items())
@@ -236,8 +266,13 @@ def main():
     print(f"  pass@1:  {final:.4f} ({n_pass}/{len(items)})")
     print(f"  avg attempts/problem: {avg_attempts:.2f}")
     print(f"  total wall time: {elapsed:.1f}s ({elapsed/len(items):.1f}s/problem)")
-    print(f"  speedup techniques: fast_dllm dual_cache + "
-          f"{'torch.compile' if args.use_compile else 'no compile'}")
+    techniques = ["fast_dllm dual_cache"]
+    if args.use_compile:
+        techniques.append("torch.compile")
+    if args.quant:
+        techniques.append(args.quant)
+    print(f"  speedup techniques: {' + '.join(techniques)}")
+    print(f"  max_new_tokens: {args.max_new_tokens}")
     print("=" * 60)
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
@@ -251,6 +286,7 @@ def main():
                 "fast_dllm_dual_cache": True,
                 "block_length": BLOCK_LENGTH,
                 "threshold": THRESHOLD,
+                "quantization": args.quant or "bf16",
                 "limit": args.limit,
                 "pass_at_1": final,
                 "n_total": len(items),
