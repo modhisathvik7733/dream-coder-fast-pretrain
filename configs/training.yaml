@@ -46,9 +46,11 @@ distillation:
   mask_ratio_bias: 0.3            # ratio = uniform()^bias; lower = more high-mask samples
 
 data:
-  python_replay_ratio: 0.4        # 40% original-distribution data (anti-forgetting)
-  reasoning_ratio: 0.3            # 30% reasoning-trace data (preserves R1 distillation)
-  general_code_ratio: 0.3         # 30% general code (KodCode + similar)
+  # Distribution matches Dream-Coder's actual training stages.
+  # Using off-distribution data would shift the model and degrade capabilities.
+  ling_coder_sft_ratio: 0.70      # Stage 2 SFT — what the instruct model was last trained on
+  dream_coder_rl_ratio: 0.20      # Stage 3 RL data
+  stack_edu_python_ratio: 0.10    # Stage 1 base adaptation coverage
   total_target_samples: 50000     # ~200M tokens at 4096 avg
   shuffle_seed: 42
 

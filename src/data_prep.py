@@ -1,18 +1,27 @@
 """Prepare training data for low-step continued pretraining.
 
-Mix:
-  40% Python competitive code (anti-forgetting from KodCode-V1)
-  30% reasoning traces (preserves R1 distillation in Dream-Coder)
-  30% general code corpus (extends competence)
+CRITICAL: replay data must match Dream-Coder's actual training distribution.
+Using off-distribution data shifts the model and degrades original capabilities.
 
-Output: a single JSONL with {input_ids: [...], labels: [...]} ready for SFT.
+Dream-Coder's actual training stages (from official repo):
+  - Base (adaptation): mix of Stack v2, OpenCoder, Stack-Edu, DCLM, math, etc.
+  - Instruct (SFT):    inclusionAI/Ling-Coder-SFT (single dataset, 7 epochs)
+  - RL:                Dream-org/Dream-Coder-RL-17k
+
+For continued pretraining (this script's purpose), we replay from the LATEST
+training stages so distribution shift is minimized:
+  70% Ling-Coder-SFT        (matches Stage 2 — what the instruct model was last trained on)
+  20% Dream-Coder-RL-17k    (matches Stage 3 — RL prompt distribution)
+  10% Stack v2 subset       (some base coverage to preserve breadth)
+
+This way our biased-mask training applies to data the model already knows,
+purely teaching it to handle high-mask cases on familiar content.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import random
-import sys
 from pathlib import Path
 
 from datasets import load_dataset
@@ -20,18 +29,40 @@ from tqdm import tqdm
 from transformers import AutoTokenizer
 
 
-def filter_python(row, min_chars: int = 50, max_chars: int = 4000) -> bool:
-    """Quality filter for Python code training rows."""
-    sol = row.get("solution") or row.get("code") or row.get("output") or ""
-    if not isinstance(sol, str):
-        return False
-    return min_chars <= len(sol) <= max_chars and "def " in sol
+def format_messages_to_text(messages: list, max_chars: int = 4000) -> str | None:
+    """Concatenate a multi-turn conversation into a single text string.
+
+    Filters: must end with assistant message, total length within bounds.
+    """
+    if not isinstance(messages, list) or len(messages) < 2:
+        return None
+    if messages[-1].get("role", "").lower() != "assistant":
+        return None
+
+    parts = []
+    for m in messages:
+        role = m.get("role", "").lower()
+        if role == "human":
+            role = "user"
+        content = m.get("content", "")
+        if not isinstance(content, str):
+            return None
+        parts.append(f"<|im_start|>{role}\n{content}<|im_end|>")
+    text = "\n".join(parts)
+
+    if len(text) < 100 or len(text) > max_chars:
+        return None
+    return text
 
 
-def format_instruction_pair(prompt: str, response: str, tokenizer, max_seq_length: int) -> dict | None:
-    """Tokenize a single (prompt, response) pair into ids + labels."""
-    full = f"{prompt.strip()}\n\n{response.strip()}"
-    ids = tokenizer(full, add_special_tokens=True, truncation=True, max_length=max_seq_length)
+def tokenize_to_sample(text: str, tokenizer, max_seq_length: int) -> dict | None:
+    """Tokenize text to (input_ids, attention_mask) within seq length."""
+    ids = tokenizer(
+        text,
+        add_special_tokens=True,
+        truncation=True,
+        max_length=max_seq_length,
+    )
     if len(ids.input_ids) < 64:
         return None
     return {
@@ -41,88 +72,99 @@ def format_instruction_pair(prompt: str, response: str, tokenizer, max_seq_lengt
     }
 
 
-def collect_python_replay(target: int, tokenizer, max_seq_length: int) -> list[dict]:
-    """40% of mix: Python competitive code from KodCode-V1."""
-    print(f"Pulling Python replay data (target {target}) ...")
+def collect_lingcoder(target: int, tokenizer, max_seq_length: int) -> list[dict]:
+    """Primary replay source: Ling-Coder-SFT (Dream-Coder-Instruct's SFT data)."""
+    print(f"Pulling Ling-Coder-SFT (target {target}) — Dream-Coder's actual SFT data ...")
     out = []
     try:
-        ds = load_dataset("KodCode/KodCode-V1", split="train", streaming=True)
+        ds = load_dataset("inclusionAI/Ling-Coder-SFT", split="train", streaming=True)
     except Exception as e:
-        print(f"  KodCode load failed: {e}; skipping.")
-        return []
+        print(f"  Ling-Coder-SFT load failed: {e}")
+        return out
 
-    for row in tqdm(ds, desc="kodcode"):
-        if not filter_python(row):
+    for row in tqdm(ds, desc="ling-coder-sft"):
+        messages = row.get("messages")
+        text = format_messages_to_text(messages)
+        if not text:
             continue
-        prompt = row.get("question") or row.get("problem") or ""
-        sol = row.get("solution") or row.get("code") or ""
-        if not (prompt and sol):
-            continue
-        item = format_instruction_pair(prompt, sol, tokenizer, max_seq_length)
-        if item is not None:
+        item = tokenize_to_sample(text, tokenizer, max_seq_length)
+        if item:
             out.append(item)
         if len(out) >= target:
             break
-    print(f"  Got {len(out)} Python samples")
+    print(f"  Collected {len(out)} Ling-Coder-SFT samples")
     return out
 
 
-def collect_reasoning(target: int, tokenizer, max_seq_length: int) -> list[dict]:
-    """30% of mix: reasoning traces (preserves R1 distillation)."""
-    print(f"Pulling reasoning data (target {target}) ...")
+def collect_dream_rl(target: int, tokenizer, max_seq_length: int) -> list[dict]:
+    """Secondary replay: Dream-Coder-RL-17k (the RL stage data)."""
+    print(f"Pulling Dream-Coder-RL-17k (target {target}) — RL stage data ...")
     out = []
     try:
-        ds = load_dataset("nvidia/OpenCodeReasoning", split="train", streaming=True)
+        ds = load_dataset("Dream-org/Dream-Coder-RL-17k", split="train", streaming=True)
     except Exception as e:
-        print(f"  OpenCodeReasoning load failed: {e}; skipping.")
-        return []
+        print(f"  Dream-Coder-RL-17k load failed: {e}")
+        return out
 
-    for row in tqdm(ds, desc="opencodereasoning"):
-        prompt = row.get("question") or row.get("input") or ""
-        response = row.get("response") or row.get("output") or ""
-        if not (isinstance(prompt, str) and isinstance(response, str)):
+    for row in tqdm(ds, desc="dream-coder-rl"):
+        # RL data may have varying schema. Try common fields.
+        messages = row.get("messages") or row.get("prompt")
+        response = row.get("response") or row.get("solution") or row.get("answer")
+
+        text = None
+        if messages and isinstance(messages, list):
+            text = format_messages_to_text(messages)
+        elif messages and isinstance(messages, str) and response:
+            full = [
+                {"role": "user", "content": messages},
+                {"role": "assistant", "content": response if isinstance(response, str) else str(response)},
+            ]
+            text = format_messages_to_text(full)
+
+        if not text:
             continue
-        if "<think>" not in response or "</think>" not in response:
-            continue
-        if len(response) < 200 or len(response) > 8000:
-            continue
-        item = format_instruction_pair(prompt, response, tokenizer, max_seq_length)
-        if item is not None:
+        item = tokenize_to_sample(text, tokenizer, max_seq_length)
+        if item:
             out.append(item)
         if len(out) >= target:
             break
-    print(f"  Got {len(out)} reasoning samples")
+    print(f"  Collected {len(out)} Dream-Coder-RL samples")
     return out
 
 
-def collect_general_code(target: int, tokenizer, max_seq_length: int) -> list[dict]:
-    """30% of mix: general code corpus (Bespoke-Stratos as fallback)."""
-    print(f"Pulling general code data (target {target}) ...")
+def collect_stack_v2_python(target: int, tokenizer, max_seq_length: int) -> list[dict]:
+    """Tertiary replay: Stack v2 Python subset for breadth.
+
+    We use the smol variant Dream-Coder used during base adaptation.
+    Note: full The Stack v2 needs auth + license attestation. Using a public proxy
+    or stack-edu-py which is openly available.
+    """
+    print(f"Pulling Stack-Edu Python (target {target}) — base adaptation data ...")
     out = []
     try:
-        ds = load_dataset("bespokelabs/Bespoke-Stratos-17k", split="train", streaming=True)
+        # Stack-Edu Python — same one Dream-Coder used in base adaptation
+        ds = load_dataset("HuggingFaceTB/stack-edu", "python", split="train", streaming=True)
     except Exception as e:
-        print(f"  Bespoke-Stratos load failed: {e}; skipping.")
-        return []
+        print(f"  Stack-Edu Python load failed: {e} — trying alternative")
+        try:
+            # Fallback: code subset of fineweb-edu equivalent
+            ds = load_dataset("HuggingFaceTB/smollm-corpus", "python-edu", split="train", streaming=True)
+        except Exception as e2:
+            print(f"  Alternative also failed: {e2}")
+            return out
 
-    for row in tqdm(ds, desc="bespoke-stratos"):
-        prompt = row.get("system") or row.get("conversations", [{}])[0].get("value", "") if isinstance(row.get("conversations"), list) else ""
-        response = ""
-        convs = row.get("conversations")
-        if isinstance(convs, list) and len(convs) >= 2:
-            prompt = convs[0].get("value", "") if isinstance(convs[0], dict) else ""
-            response = convs[1].get("value", "") if isinstance(convs[1], dict) else ""
-
-        if not (prompt and response):
+    for row in tqdm(ds, desc="stack-edu-py"):
+        text = row.get("text") or row.get("content") or row.get("code")
+        if not isinstance(text, str):
             continue
-        if len(response) < 100 or len(response) > 6000:
+        if len(text) < 200 or len(text) > 4000:
             continue
-        item = format_instruction_pair(prompt, response, tokenizer, max_seq_length)
-        if item is not None:
+        item = tokenize_to_sample(text, tokenizer, max_seq_length)
+        if item:
             out.append(item)
         if len(out) >= target:
             break
-    print(f"  Got {len(out)} general code samples")
+    print(f"  Collected {len(out)} Stack-Edu Python samples")
     return out
 
 
@@ -140,15 +182,23 @@ def main():
     print(f"Loading tokenizer: {args.tokenizer_path}")
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
 
-    # 40/30/30 split
-    n_python = int(args.target_samples * 0.40)
-    n_reason = int(args.target_samples * 0.30)
-    n_general = args.target_samples - n_python - n_reason
+    # Distribution matched to Dream-Coder's training stages:
+    # 70% Ling-Coder-SFT (Stage 2 — most recent)
+    # 20% Dream-Coder-RL-17k (Stage 3)
+    # 10% Stack-Edu Python (Stage 1 base coverage)
+    n_ling = int(args.target_samples * 0.70)
+    n_rl = int(args.target_samples * 0.20)
+    n_stack = args.target_samples - n_ling - n_rl
 
     samples = []
-    samples.extend(collect_python_replay(n_python, tokenizer, args.max_seq_length))
-    samples.extend(collect_reasoning(n_reason, tokenizer, args.max_seq_length))
-    samples.extend(collect_general_code(n_general, tokenizer, args.max_seq_length))
+    samples.extend(collect_lingcoder(n_ling, tokenizer, args.max_seq_length))
+    samples.extend(collect_dream_rl(n_rl, tokenizer, args.max_seq_length))
+    samples.extend(collect_stack_v2_python(n_stack, tokenizer, args.max_seq_length))
+
+    if not samples:
+        print("ERROR: no samples collected from any source.")
+        print("Check internet connectivity and dataset access (some require auth).")
+        exit(1)
 
     random.seed(42)
     random.shuffle(samples)
@@ -164,12 +214,21 @@ def main():
     print(f"Total tokens: {total_tokens:,}  (~{total_tokens/1e6:.1f}M)")
     print(f"Avg length: {total_tokens / max(1, len(samples)):.0f} tokens")
 
-    # Also write a meta file
     meta = {
         "n_samples": len(samples),
         "total_tokens": total_tokens,
         "max_seq_length": args.max_seq_length,
         "avg_length": total_tokens / max(1, len(samples)),
+        "data_mix": {
+            "ling-coder-sft": 0.70,
+            "dream-coder-rl-17k": 0.20,
+            "stack-edu-python": 0.10,
+        },
+        "rationale": (
+            "Matches Dream-Coder's actual training distribution (Stage 2 SFT + "
+            "Stage 3 RL + Stage 1 base coverage). Using off-distribution data "
+            "would shift the model and degrade original capabilities."
+        ),
     }
     (args.output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
 

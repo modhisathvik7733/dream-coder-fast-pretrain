@@ -62,11 +62,20 @@ distillation:
   mask_ratio_bias: 0.3            # biased toward high-mask training
 
 data:
-  python_replay_ratio: 0.4        # anti-forgetting
-  reasoning_ratio: 0.3            # preserves R1 distillation
-  general_code_ratio: 0.3
+  # Matches Dream-Coder's ACTUAL training distribution (verified from official repo)
+  ling_coder_sft_ratio: 0.70      # Stage 2 SFT data
+  dream_coder_rl_ratio: 0.20      # Stage 3 RL data
+  stack_edu_python_ratio: 0.10    # Stage 1 base coverage
   total_target_samples: 50000     # ~200M tokens
 ```
+
+**Why this exact mix?** Verified from `github.com/DreamLM/Dream-Coder`:
+
+- **Stage 1 (Base):** mix of Stack v2 (40%), Stack-Edu Python (15%), OpenCoder (15%), DCLM (17%), math+general (rest)
+- **Stage 2 (Instruct SFT):** ONLY `inclusionAI/Ling-Coder-SFT` (7 epochs)
+- **Stage 3 (RL):** `Dream-org/Dream-Coder-RL-17k` with verifiable sandbox rewards
+
+We replay from Stage 2+3 primarily (most recent) plus a small Stage 1 sample for breadth. Using off-distribution data (e.g., KodCode, R1 traces) would shift the model away from its trained behavior.
 
 ## Method explained
 
