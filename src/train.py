@@ -311,6 +311,19 @@ def main():
         final_path.mkdir(parents=True, exist_ok=True)
         trainer.save_model(str(final_path))
         tokenizer.save_pretrained(str(final_path))
+
+        # HF Trainer.save_model doesn't copy custom modeling/config code; AutoModel with
+        # trust_remote_code=True requires modeling_dream.py + configuration_dream.py to
+        # be present in the load dir. Copy any .py files from the base model dir so the
+        # saved checkpoint is fully self-contained.
+        import shutil
+        base_path = Path(base_model_path)
+        for src in base_path.glob("*.py"):
+            dst = final_path / src.name
+            if not dst.exists():
+                shutil.copy2(src, dst)
+                print(f"  Copied {src.name} -> {final_path}")
+
         print(f"Saved final checkpoint to {final_path}")
     else:
         print(f"Smoke test complete ({args.max_steps} steps). No checkpoint saved.")
